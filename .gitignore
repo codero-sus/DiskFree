@@ -7,6 +7,8 @@ build/
 dist/
 
 # Environments
+# Optional, machine-local path to a portable Python (see README: Updating)
+/python.env
 .venv/
 venv/
 env/

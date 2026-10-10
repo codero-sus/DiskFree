@@ -46,6 +46,54 @@ REQUIRED_PYTHON = (3, 11)
 DEFAULT_TIMEOUT = 900
 REMOTE = "origin"
 
+#: The branch DiskFree updates from. This repository's ``main`` predates the
+#: implementation (it holds only the original README), so the updater tracks the
+#: development branch; ``--branch`` always overrides it, and a checkout whose
+#: remote has no such branch simply keeps following the branch it is on.
+DEFAULT_BRANCH = "arena/0392f96c-diskfree"
+
+#: Optional file in the checkout root that names the interpreter to use. Read by
+#: ``updater.sh``, ``updater.bat`` and this module, so portable and embeddable
+#: Python builds work the same way on Windows, Linux and macOS.
+PYTHON_ENV_FILENAME = "python.env"
+
+#: "Second python" -- for people whose first ``python`` is not the one DiskFree
+#: should use. It is not a valid POSIX shell identifier (it starts with a digit),
+#: so the launchers read it with ``printenv`` (bash) and delayed expansion (cmd)
+#: rather than ``$2PY2`` / ``%2PY2%``, both of which mean something else.
+TWO_PY_TWO = "2PY2"
+
+#: Keys honoured inside ``python.env``, most specific first.
+PYTHON_ENV_KEYS = ("DISKFREE_PYTHON", "PYTHON", TWO_PY_TWO)
+
+#: Interpreter names tried when nothing was configured, in order.
+FALLBACK_PYTHONS = ("python3", "python3.13", "python3.12", "python3.11", "python")
+
+#: Absolute locations that matter when PATH is minimal (a service, cron, or a
+#: double-clicked .bat): Homebrew on both macOS architectures, then the system.
+FALLBACK_PYTHON_PATHS = (
+    "/opt/homebrew/bin/python3",
+    "/usr/local/bin/python3",
+    "/usr/bin/python3",
+)
+
+#: Where a project-local virtualenv keeps its interpreter, per platform.
+VENV_PYTHON_RELPATHS = (("bin", "python"), ("Scripts", "python.exe"))
+
+#: The Windows launcher for "whatever Python 3 is installed".
+PY_LAUNCHER = "py -3"
+
+#: A marked JSON record survives harmless banners from sitecustomize / wrappers.
+PROBE_MARKER = "DISKFREE_UPDATER_PROBE="
+PROBE_SCRIPT = (
+    "import json,sys;"
+    "print('DISKFREE_UPDATER_PROBE='+json.dumps({"
+    "'version':list(sys.version_info[:3]),"
+    "'executable':sys.executable,"
+    "'virtualenv':sys.prefix != getattr(sys, 'base_prefix', sys.prefix)"
+    "}))"
+)
+
 # Fail fast instead of hanging on a credential prompt in a non-interactive shell.
 GIT_ENV = {
     "GIT_TERMINAL_PROMPT": "0",
@@ -112,6 +160,276 @@ def has_git() -> bool:
 
 def is_git_repo(root: Path) -> bool:
     return (root / ".git").exists()
+
+
+# --------------------------------------------------------------------------
+# which interpreter?
+# --------------------------------------------------------------------------
+
+
+def parse_env_file(path: Path) -> dict[str, str]:
+    """Read a ``KEY=VALUE`` file the way all three launchers agree on.
+
+    Tolerates blank lines, ``#`` and ``;`` comments, an ``export`` or ``set``
+    prefix and one layer of quotes. The launchers parse this file instead of
+    sourcing it (``2PY2`` is not a valid POSIX shell variable name). Inline
+    comments are deliberately *not* stripped: a Windows path may contain ``#``.
+    """
+
+    values: dict[str, str] = {}
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return values
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("#", ";", "@")) or line.lower().startswith("rem "):
+            continue
+        for prefix in ("export ", "set "):
+            if line[: len(prefix)].lower() == prefix:
+                line = line[len(prefix) :].strip()
+        if len(line) >= 2 and line[0] == line[-1] and line[0] in "\"'":
+            line = line[1:-1]
+        key, separator, value = line.partition("=")
+        if not separator:
+            # A plain one-line path is the simplest portable format and is
+            # convenient for embeddable Python. Treat it as PYTHON; dotenv-style
+            # keys remain available when a file needs more than one setting.
+            key, value = "PYTHON", line
+        key = key.strip().strip("\"'")
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1].strip()
+        if key and value:
+            values[key.upper()] = value
+    return values
+
+
+def expand_interpreter_path(value: str, root: Path) -> str:
+    """Expand ``%ROOT%``/``$ROOT``/``~`` and make a relative path project-local.
+
+    A portable Python usually sits next to the checkout, so ``2PY2=../python/
+    python.exe`` and ``DISKFREE_PYTHON=./runtime/bin/python3`` both work.
+    """
+
+    text = (value or "").strip()
+    for token in ("%ROOT%", "${ROOT}", "$ROOT"):
+        if token in text:
+            text = text.replace(token, str(root))
+    text = os.path.expanduser(text)
+    path = Path(text)
+    if path.is_absolute():
+        return str(path)
+    # A bare executable name (``python3``, ``py -3``) is resolved via PATH,
+    # unless a same-named portable executable exists in the project itself.
+    # Paths with a separator are project-relative, not cwd-relative.
+    has_separator = os.path.sep in text or bool(os.path.altsep and os.path.altsep in text)
+    if not has_separator:
+        local_path = root / path
+        return str(local_path) if local_path.exists() else text
+    return str(root / path)
+
+
+def python_env_values(root: Path) -> dict[str, str]:
+    """The recognised interpreter keys from ``<root>/python.env``."""
+
+    found = parse_env_file(root / PYTHON_ENV_FILENAME)
+    values: dict[str, str] = {}
+    for key, value in found.items():
+        upper = key.upper()
+        if upper in PYTHON_ENV_KEYS and upper not in values:
+            values[upper] = expand_interpreter_path(value, root)
+    return values
+
+
+@dataclass(slots=True)
+class PythonCandidate:
+    """One interpreter the updater could use, and what came of trying it."""
+
+    path: str
+    source: str
+    explicit: bool = False
+    probed: bool = False
+    executable: str = ""
+    usable: bool = False
+    version: str = ""
+    virtualenv: bool = False
+    reason: str = ""
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "path": self.path,
+            "source": self.source,
+            "explicit": self.explicit,
+            "probed": self.probed,
+            "executable": self.executable,
+            "usable": self.usable,
+            "version": self.version,
+            "virtualenv": self.virtualenv,
+            "reason": self.reason,
+        }
+
+
+def version_at_least(version: str, minimum: tuple[int, int] = REQUIRED_PYTHON) -> bool:
+    parts: list[int] = []
+    for chunk in (version or "").split(".")[:2]:
+        digits = "".join(character for character in chunk if character.isdigit())
+        if not digits:
+            return False
+        parts.append(int(digits))
+    return len(parts) == 2 and tuple(parts) >= minimum
+
+
+def probe_python(candidate: PythonCandidate, *, timeout: int = 60) -> PythonCandidate:
+    """Run the candidate once and record its version, or why it cannot be used."""
+
+    candidate.probed = True
+    text = (candidate.path or "").strip()
+    if not text:
+        candidate.reason = "no interpreter was named"
+        return candidate
+
+    # The Windows launcher is the only supported value containing arguments.
+    # Every other value is treated as one executable path, including a path
+    # with spaces (for example C:\\Program Files\\Python\\python.exe).
+    launcher_args: list[str] = []
+    if text.lower() in {"py -3", "py.exe -3"}:
+        head, launcher_args = text.split()[0], text.split()[1:]
+    else:
+        head = text
+
+    has_separator = os.path.sep in head or bool(os.path.altsep and os.path.altsep in head)
+    if os.path.isabs(head) or has_separator:
+        executable = head
+    else:
+        executable = shutil.which(head) or ""
+    if not executable:
+        candidate.reason = f"'{head}' was not found on PATH"
+        return candidate
+    if not Path(executable).exists():
+        candidate.reason = f"{executable} does not exist"
+        return candidate
+
+    result = run([executable, *launcher_args, "-c", PROBE_SCRIPT], timeout=timeout)
+    if not result.ok:
+        candidate.reason = f"it did not run: {_tail(result.output, 200) or 'no output'}"
+        return candidate
+    payload = next(
+        (
+            line.partition(PROBE_MARKER)[2]
+            for line in reversed(result.output.splitlines())
+            if line.startswith(PROBE_MARKER)
+        ),
+        "",
+    )
+    try:
+        probe = json.loads(payload)
+        version_parts = probe["version"]
+        version = ".".join(str(part) for part in version_parts[:3])
+        resolved = str(probe["executable"])
+        candidate.virtualenv = bool(probe["virtualenv"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        candidate.reason = f"unexpected output: {_tail(result.output, 160)}"
+        return candidate
+
+    candidate.version = version
+    candidate.executable = resolved or executable
+    if not version_at_least(version):
+        candidate.reason = (
+            f"Python {version or '?'} is older than "
+            f"{'.'.join(map(str, REQUIRED_PYTHON))}"
+        )
+        return candidate
+    candidate.usable = True
+    return candidate
+
+
+def python_candidates(root: Path, explicit: str | None = None) -> list[PythonCandidate]:
+    """Every interpreter worth trying, most authoritative first.
+
+    Order: ``--python``, ``DISKFREE_PYTHON``, ``python.env`` (its own keys or a
+    plain path), ``2PY2``, a project-local virtualenv, the running interpreter,
+    then platform launchers and PATH. The configured choices are *explicit*: if
+    one is broken the report says so instead of quietly using a different Python.
+    """
+
+    candidates: list[PythonCandidate] = []
+    seen: set[str] = set()
+
+    def add(path: str, source: str, *, wanted: bool) -> None:
+        key = (path or "").strip()
+        if not key or key.lower() in seen:
+            return
+        seen.add(key.lower())
+        candidates.append(PythonCandidate(key, source, explicit=wanted))
+
+    if explicit:
+        add(expand_interpreter_path(explicit, root), "--python", wanted=True)
+
+    from_env = (os.environ.get("DISKFREE_PYTHON") or "").strip()
+    if from_env:
+        add(
+            expand_interpreter_path(from_env, root),
+            "DISKFREE_PYTHON (environment)",
+            wanted=True,
+        )
+
+    env_file = python_env_values(root)
+    for key in PYTHON_ENV_KEYS:
+        if key in env_file:
+            add(env_file[key], f"{PYTHON_ENV_FILENAME} ({key})", wanted=True)
+
+    second = (os.environ.get(TWO_PY_TWO) or "").strip()
+    if second:
+        add(
+            expand_interpreter_path(second, root),
+            f"{TWO_PY_TWO} (environment)",
+            wanted=True,
+        )
+
+    for name in (".venv", "venv"):
+        for parts in VENV_PYTHON_RELPATHS:
+            path = root.joinpath(name, *parts)
+            if path.exists():
+                add(str(path), f"{name}/ inside the project", wanted=False)
+
+    if sys.executable:
+        add(sys.executable, "the interpreter running DiskFree", wanted=False)
+
+    if os.name == "nt":
+        add(PY_LAUNCHER, "the Windows py launcher", wanted=False)
+    for name in FALLBACK_PYTHONS:
+        add(name, f"PATH ({name})", wanted=False)
+    for path in FALLBACK_PYTHON_PATHS:
+        add(path, path, wanted=False)
+    return candidates
+
+
+def resolve_python(
+    root: Path, explicit: str | None = None, *, timeout: int = 60
+) -> tuple[PythonCandidate | None, list[PythonCandidate]]:
+    """The first interpreter that runs and is new enough, plus what was tried."""
+
+    tried: list[PythonCandidate] = []
+    chosen: PythonCandidate | None = None
+    for candidate in python_candidates(root, explicit):
+        probe_python(candidate, timeout=timeout)
+        tried.append(candidate)
+        if candidate.usable:
+            chosen = candidate
+            break
+    return chosen, tried
+
+
+def python_warnings(tried: Sequence[PythonCandidate]) -> list[str]:
+    """Explain every interpreter that was *asked for* and could not be used."""
+
+    return [
+        f"{candidate.source}: '{candidate.path}' was not used — {candidate.reason}"
+        for candidate in tried
+        if candidate.explicit and not candidate.usable and candidate.reason
+    ]
 
 
 @dataclass(slots=True)
@@ -211,6 +529,11 @@ class UpdateReport:
     before_commit: str = ""
     after_commit: str = ""
     branch: str = ""
+    tracked_branch: str = DEFAULT_BRANCH
+    requested_branch: str = ""
+    python_version: str = ""
+    python_source: str = ""
+    python_warnings: list[str] = field(default_factory=list)
     dirty: bool = False
     untracked: int = 0
     upstream_known: bool = False
@@ -242,8 +565,13 @@ class UpdateReport:
             "already_current": self.already_current,
             "root": self.root,
             "python": self.python,
+            "python_version": self.python_version,
+            "python_source": self.python_source,
+            "python_warnings": self.python_warnings,
             "virtualenv": self.venv,
             "branch": self.branch,
+            "tracked_branch": self.tracked_branch,
+            "requested_branch": self.requested_branch,
             "dirty_worktree": self.dirty,
             "untracked_files": self.untracked,
             "upstream_known": self.upstream_known,
@@ -293,12 +621,22 @@ def format_report(report: UpdateReport, *, colour: bool | None = None) -> str:
     lines.append(f"  checkout   {report.root}")
     if report.before_version and report.before_version != "unknown":
         lines.append(f"  version    {report.before_version}")
-    lines.append(f"  python     {report.python}" + ("" if report.venv else "  (system)"))
+    python_line = f"  python     {report.python}"
+    if report.python_version:
+        python_line += f"  ({report.python_version}"
+        python_line += ", virtualenv)" if report.venv else ", system)"
+    if report.python_source:
+        python_line += f"  [{report.python_source}]"
+    lines.append(python_line)
+    for warning in report.python_warnings:
+        lines.append(palette.yellow(f"  ! {warning}"))
     if report.branch:
         state = "local changes" if report.dirty else "no local changes"
         if report.untracked:
             state += f", {report.untracked} untracked file(s)"
         lines.append(f"  branch     {report.branch} ({state})")
+        if report.tracked_branch and report.tracked_branch != report.branch:
+            lines.append(f"  tracking   {REMOTE}/{report.tracked_branch}")
 
     for step in report.steps:
         if step.skipped:
@@ -327,8 +665,9 @@ def format_report(report: UpdateReport, *, colour: bool | None = None) -> str:
     if report.commits_available and not report.changed:
         lines.append(
             palette.yellow(
-                f"{report.commits_available} update(s) available; nothing was changed "
-                "(--check). Re-run without --check to apply them."
+                f"{report.commits_available} update(s) available; checkout and dependencies "
+                "were left unchanged (--check; remote refs were fetched). "
+                "Re-run without --check to apply them."
             )
         )
     elif report.before_version != report.after_version:
@@ -460,6 +799,21 @@ def worktree_status(root: Path) -> tuple[int, int]:
     return modified, untracked
 
 
+def remote_branch_exists(root: Path, branch: str) -> bool:
+    result = git(
+        root, "rev-parse", "--verify", "--quiet", f"refs/remotes/{REMOTE}/{branch}",
+        timeout=30,
+    )
+    return result.ok and bool(result.output.strip())
+
+
+def local_branch_exists(root: Path, branch: str) -> bool:
+    result = git(
+        root, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", timeout=30
+    )
+    return result.ok and bool(result.output.strip())
+
+
 def commits_behind(root: Path, branch: str) -> int | None:
     """How many commits ``origin/<branch>`` is ahead, or ``None`` if unknown."""
 
@@ -508,7 +862,8 @@ class UpdateOptions:
 
     root: Path = field(default_factory=repo_root)
     branch: str | None = None
-    python: str = field(default_factory=lambda: sys.executable or "python3")
+    #: ``None`` means resolve DISKFREE_PYTHON/python.env/2PY2, then local or running Python.
+    python: str | None = None
     use_git: bool = True
     upgrade_dependencies: bool = True
     reinstall: bool = True
@@ -559,30 +914,39 @@ def _handle_externally_managed(
 def preflight(options: UpdateOptions, report: UpdateReport) -> bool:
     """Environment checks. Returns False when continuing makes no sense."""
 
-    version = sys.version_info[:2]
-    if version < REQUIRED_PYTHON:
+    # The interpreter that matters is the one DiskFree will be installed into,
+    # which is not necessarily the one running this script.
+    if not version_at_least(report.python_version):
         report.add(
             Step(
                 "preflight",
                 ok=False,
                 detail=(
-                    f"Python {'.'.join(map(str, version))} is too old; DiskFree needs "
-                    f"{'.'.join(map(str, REQUIRED_PYTHON))} or newer"
+                    f"Python {report.python_version or 'unknown'} at {options.python} is too "
+                    f"old; DiskFree needs {'.'.join(map(str, REQUIRED_PYTHON))} or newer"
                 ),
-                hint="Run the updater with a newer interpreter, e.g. ./updater.sh after "
-                     "setting DISKFREE_PYTHON=/usr/bin/python3.12",
+                hint=(
+                    "Point the updater at a newer interpreter: --python /path/to/python3.12, "
+                    f"a {PYTHON_ENV_FILENAME} file in the project root, DISKFREE_PYTHON, or "
+                    f"{TWO_PY_TWO} for a portable/embeddable Python."
+                ),
             )
         )
         return False
-    report.add(
-        Step(
-            "preflight",
-            detail=(
-                f"Python {sys.version.split()[0]} at {options.python}"
-                + (" (virtualenv)" if report.venv else " (system interpreter)")
-            ),
-        )
+    detail = (
+        f"Python {report.python_version} at {options.python}"
+        + (" (virtualenv)" if report.venv else " (system interpreter)")
     )
+    if report.python_source:
+        detail += f" — chosen from {report.python_source}"
+    hint = ""
+    if sys.version_info[:2] < REQUIRED_PYTHON:
+        hint = (
+            f"The updater itself is running under "
+            f"{'.'.join(map(str, sys.version_info[:2]))}; dependencies will be installed "
+            f"for Python {report.python_version}."
+        )
+    report.add(Step("preflight", detail=detail, hint=hint))
     if not (options.root / PACKAGE_DIR_NAME / "__init__.py").is_file():
         report.add(
             Step(
@@ -595,6 +959,57 @@ def preflight(options: UpdateOptions, report: UpdateReport) -> bool:
         return False
     report.add(Step("locate source", detail=str(options.root)))
     return True
+
+
+def choose_branch(
+    options: UpdateOptions, report: UpdateReport, root: Path
+) -> str | None:
+    """Decide which branch to track. ``None`` (and a step) when it cannot be used.
+
+    ``--branch`` wins. Otherwise DiskFree tracks :data:`DEFAULT_BRANCH`, because
+    that is where the product lives; a checkout whose remote has no such branch
+    (a fork, an older mirror) keeps following the branch it is already on.
+    """
+
+    current = report.branch or current_branch(root)
+    report.branch = current
+
+    if options.branch:
+        target = options.branch
+        report.tracked_branch = target
+        if not (remote_branch_exists(root, target) or local_branch_exists(root, target)):
+            report.add(
+                Step(
+                    "choose branch",
+                    ok=False,
+                    detail=f"'{target}' was not found on {REMOTE} or in this checkout",
+                    hint=(
+                        "Run `git branch -a` to see what exists, or omit --branch to track "
+                        f"{DEFAULT_BRANCH}."
+                    ),
+                )
+            )
+            return None
+        return target
+
+    if remote_branch_exists(root, DEFAULT_BRANCH):
+        report.tracked_branch = DEFAULT_BRANCH
+        if current != DEFAULT_BRANCH:
+            report.add(
+                Step(
+                    "choose branch",
+                    detail=(
+                        f"{current or '(detached)'} → {DEFAULT_BRANCH}: DiskFree updates from "
+                        f"{DEFAULT_BRANCH}. Pass --branch to follow another."
+                    ),
+                )
+            )
+        return DEFAULT_BRANCH
+
+    # No such branch on this remote: follow the checkout's own branch and let
+    # the comparison below report honestly if that has no upstream either.
+    report.tracked_branch = current
+    return current
 
 
 def update_source(options: UpdateOptions, report: UpdateReport) -> bool:
@@ -619,30 +1034,8 @@ def update_source(options: UpdateOptions, report: UpdateReport) -> bool:
 
     branch = report.branch or current_branch(options.root)
     report.branch = branch
-    if options.branch and options.branch != branch:
-        if report.dirty:
-            report.add(
-                Step("switch branch", ok=False,
-                     detail=f"worktree has local changes; not switching {branch} → "
-                            f"{options.branch}",
-                     hint="Commit or stash your changes, then re-run with --branch.")
-            )
-            return False
-        switched = git(options.root, "switch", options.branch, timeout=120)
-        if not switched.ok:
-            fetched = git(options.root, "fetch", REMOTE, options.branch, timeout=options.timeout)
-            switched = git(options.root, "switch", options.branch, timeout=120)
-            if not switched.ok:
-                report.add(
-                    Step("switch branch", ok=False, output=switched.output or fetched.output,
-                         detail=f"could not switch to '{options.branch}'",
-                         hint=f"Check the branch name exists on {REMOTE}.")
-                )
-                return False
-        branch = options.branch
-        report.branch = branch
-        report.add(Step("switch branch", detail=f"now on {branch}"))
 
+    # Fetch before choosing a branch: only the remote knows which branches exist.
     fetched = git(options.root, "fetch", REMOTE, "--prune", timeout=options.timeout)
     if not fetched.ok:
         detail = "could not reach the remote"
@@ -655,30 +1048,71 @@ def update_source(options: UpdateOptions, report: UpdateReport) -> bool:
         return False
     report.add(Step("git fetch", detail=f"{REMOTE} fetched"))
 
-    behind = commits_behind(options.root, branch)
+    target = choose_branch(options, report, options.root)
+    if target is None:
+        return False
+
+    if target != branch:
+        if options.check_only:
+            # --check promises not to alter the checkout, and switching branches
+            # changes it: report the intention and compare against the remote
+            # branch instead of checking it out.
+            report.add(
+                Step(
+                    "switch branch",
+                    skipped=True,
+                    detail=(
+                        f"would switch {branch} → {target}"
+                        + (" (blocked: this checkout has local changes)" if report.dirty else "")
+                    ),
+                )
+            )
+        elif report.dirty:
+            report.add(
+                Step("switch branch", ok=False,
+                     detail=f"worktree has local changes; not switching {branch} → {target}",
+                     hint="Commit or stash your changes (`git stash`), then re-run. "
+                          "DiskFree never discards your work.")
+            )
+            return False
+        else:
+            switched = git(options.root, "switch", target, timeout=120)
+            if not switched.ok:
+                report.add(
+                    Step("switch branch", ok=False, output=switched.output,
+                         detail=f"could not switch to '{target}'",
+                         hint=f"Check the branch exists on {REMOTE} (`git branch -a`). "
+                              "The checkout was left on its current branch.")
+                )
+                return False
+            branch = target
+            report.branch = target
+            report.add(Step("switch branch", detail=f"now on {target}"))
+
+    behind = commits_behind(options.root, target)
     report.upstream_known = behind is not None
     report.commits_available = behind or 0
     if behind is None:
-        # No origin/<branch> to compare against: say so rather than claim success.
+        # No origin/<target> to compare against: say so rather than claim success.
         report.add(
             Step(
                 "git update",
                 skipped=True,
-                detail=f"{REMOTE}/{branch} does not exist; nothing to compare against",
+                detail=f"{REMOTE}/{target} does not exist; nothing to compare against",
                 hint="Push the branch, or update a published one with `--branch main`. "
                      "The local code was left untouched.",
             )
         )
         return True
-    if behind == 0:
+    if behind == 0 and branch == target:
         report.already_current = True
-        report.add(Step("git update", detail=f"{branch} is already up to date"))
+        report.add(Step("git update", detail=f"{target} is already up to date"))
         return True
     if options.check_only:
-        report.add(
-            Step("git update", skipped=True,
-                 detail=f"{behind} commit(s) available on {REMOTE}/{branch}")
-        )
+        detail = f"{behind} commit(s) available on {REMOTE}/{target}"
+        if branch != target:
+            detail += f" (this checkout is on {branch})"
+        report.add(Step("git update", skipped=True, detail=detail))
         return True
     if report.dirty:
         report.add(
@@ -689,7 +1123,7 @@ def update_source(options: UpdateOptions, report: UpdateReport) -> bool:
         )
         return False
 
-    pulled = git(options.root, "merge", "--ff-only", f"{REMOTE}/{branch}", timeout=options.timeout)
+    pulled = git(options.root, "merge", "--ff-only", f"{REMOTE}/{target}", timeout=options.timeout)
     if not pulled.ok:
         report.add(
             Step("git update", ok=False, detail="fast-forward was not possible",
@@ -698,7 +1132,7 @@ def update_source(options: UpdateOptions, report: UpdateReport) -> bool:
                       "yourself; the updater will not rewrite history.")
         )
         return False
-    report.add(Step("git update", detail=f"fast-forwarded {branch} ({behind} commit(s))"))
+    report.add(Step("git update", detail=f"fast-forwarded {target} ({behind} commit(s))"))
     return True
 
 
@@ -797,8 +1231,28 @@ def update(options: UpdateOptions | None = None) -> UpdateReport:
 
     options = options or UpdateOptions()
     options.root = Path(options.root).resolve()
+
+    chosen, tried = resolve_python(options.root, options.python)
+    if chosen is not None:
+        options.python = chosen.executable or chosen.path
+        source = chosen.source
+        version = chosen.version
+        venv = chosen.virtualenv
+    else:
+        # Nothing configured works. Keep going with the interpreter that is
+        # already running this script so the source can still be updated, and
+        # say so in the report rather than pretending everything is fine.
+        options.python = sys.executable or "python3"
+        source = "nothing configured worked; using the running interpreter"
+        version = "{}.{}.{}".format(*sys.version_info[:3])
+        venv = in_virtualenv()
+
     report = UpdateReport(root=str(options.root), python=options.python)
-    report.venv = in_virtualenv()
+    report.python_version = version
+    report.python_source = source
+    report.python_warnings = python_warnings(tried)
+    report.venv = venv
+    report.requested_branch = options.branch or ""
     started = time.monotonic()
 
     report.before_version = read_version(options.root)
@@ -849,15 +1303,26 @@ def build_parser() -> argparse.ArgumentParser:
             "examples:\n"
             "  ./updater.sh                  update in place\n"
             "  ./updater.sh --check          what would change?\n"
-            "  ./updater.sh --branch main    follow a specific branch\n"
+            "  ./updater.sh --show-python    which interpreter will be used, and why\n"
+            "  ./updater.sh --branch main    follow a branch other than the default\n"
             "  ./updater.sh --no-deps        update the code only\n"
             "  ./updater.sh --json           machine-readable report\n"
+            "\n"
+            f"which interpreter is used, in order: --python, $DISKFREE_PYTHON,\n"
+            f"{PYTHON_ENV_FILENAME} in the project root (DISKFREE_PYTHON / PYTHON / "
+            f"{TWO_PY_TWO}, or a plain path), ${TWO_PY_TWO},\n"
+            "a project venv, the running interpreter, then platform launchers / PATH.\n"
+            f"Updates are taken from {REMOTE}/{DEFAULT_BRANCH} unless --branch says "
+            "otherwise.\n"
         ),
     )
     parser.add_argument("-c", "--check", action="store_true", dest="check_only",
-                        help="report what would change without modifying anything")
+                        help="report what would change; refresh remote refs but leave the "
+                             "checkout and dependencies untouched")
     parser.add_argument("-b", "--branch", default=None,
-                        help="branch to update (default: the current one)")
+                        help=f"branch to update (default: {DEFAULT_BRANCH}, which is where "
+                             "DiskFree's code lives; the current branch if the remote has "
+                             "no such branch)")
     parser.add_argument("--no-git", action="store_true",
                         help="skip fetching; only refresh dependencies")
     parser.add_argument("--no-deps", action="store_true", dest="no_deps",
@@ -868,8 +1333,13 @@ def build_parser() -> argparse.ArgumentParser:
                         help="pass --break-system-packages to pip when the OS marks the "
                              "interpreter as externally managed (prefer a virtualenv)")
     parser.add_argument("--python", default=None,
-                        help="interpreter to install into (default: the one running this "
-                             "script)")
+                        help="interpreter to install into (default: resolved from "
+                             f"$DISKFREE_PYTHON, {PYTHON_ENV_FILENAME} in the project root "
+                             f"(a key or plain path), ${TWO_PY_TWO}, a project venv, "
+                             "the running interpreter, then PATH)")
+    parser.add_argument("--show-python", action="store_true", dest="show_python",
+                        help="print the interpreter resolution (including every candidate "
+                             "that was rejected, and why) and exit")
     parser.add_argument("--root", default=None,
                         help="checkout to update (default: the one containing this script)")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT,
@@ -881,16 +1351,108 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def show_python(
+    root: Path, explicit: str | None = None, *, as_json: bool = False
+) -> int:
+    """Print which interpreter would be used, and why the others would not.
+
+    Portable and embeddable Python installs are the usual reason to ask: the
+    ``python`` on PATH is often not the one DiskFree should be installed into.
+    """
+
+    candidates = python_candidates(root, explicit)
+    probed: list[PythonCandidate] = []
+    chosen: PythonCandidate | None = None
+    for candidate in candidates:
+        if chosen is None:
+            probe_python(candidate)
+            if candidate.usable:
+                chosen = candidate
+        probed.append(candidate)
+
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "root": str(root),
+                    "python_env_file": str(root / PYTHON_ENV_FILENAME),
+                    "python_env_present": (root / PYTHON_ENV_FILENAME).is_file(),
+                    "python_env": python_env_values(root),
+                    "environment": {
+                        "DISKFREE_PYTHON": os.environ.get("DISKFREE_PYTHON"),
+                        TWO_PY_TWO: os.environ.get(TWO_PY_TWO),
+                    },
+                    "selected": chosen.as_dict() if chosen else None,
+                    "candidates": [candidate.as_dict() for candidate in probed],
+                    "required_python": ".".join(map(str, REQUIRED_PYTHON)),
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+        return EXIT_OK if chosen else EXIT_FAILED
+
+    lines = [f"Interpreter resolution for {root}"]
+    env_file = root / PYTHON_ENV_FILENAME
+    values = python_env_values(root)
+    lines.append(
+        f"  {PYTHON_ENV_FILENAME}   "
+        + (
+            ", ".join(f"{key}={value}" for key, value in values.items())
+            if values
+            else ("present, but no recognised key" if env_file.is_file() else "not present")
+        )
+    )
+    lines.append(
+        f"  DISKFREE_PYTHON   {os.environ.get('DISKFREE_PYTHON') or 'not set'}"
+    )
+    lines.append(f"  {TWO_PY_TWO}{'':<12}{os.environ.get(TWO_PY_TWO) or 'not set'}")
+    lines.append(
+        f"  required          Python {'.'.join(map(str, REQUIRED_PYTHON))} or newer"
+    )
+    lines.append("")
+    for index, candidate in enumerate(probed, start=1):
+        if candidate is chosen:
+            outcome = f"SELECTED (Python {candidate.version}"
+            outcome += ", virtualenv)" if candidate.virtualenv else ", system)"
+        elif not candidate.probed:
+            outcome = "not tried (an earlier candidate was selected)"
+        elif candidate.usable:
+            outcome = "usable, but an earlier candidate won"
+        else:
+            outcome = f"rejected: {candidate.reason or 'unusable'}"
+        lines.append(
+            f"  {index:>2}. {candidate.source:<34} {candidate.path:<46} {outcome}"
+        )
+    lines.append("")
+    if chosen is None:
+        lines.append(
+            f"No usable interpreter was found. Write the path to Python "
+            f"{'.'.join(map(str, REQUIRED_PYTHON))}+ into {PYTHON_ENV_FILENAME} next to "
+            f"this script, or set DISKFREE_PYTHON or {TWO_PY_TWO}."
+        )
+        print("\n".join(lines))
+        return EXIT_FAILED
+    lines.append(
+        f"Selected {chosen.executable or chosen.path} (Python {chosen.version}) "
+        f"from {chosen.source}."
+    )
+    print("\n".join(lines))
+    return EXIT_OK
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     root = Path(args.root).resolve() if args.root else repo_root()
-    python = args.python or sys.executable or "python3"
+    if args.show_python:
+        return show_python(root, args.python, as_json=args.json)
+
     options = UpdateOptions(
         root=root,
         branch=args.branch,
-        python=python,
+        python=args.python,
         use_git=not args.no_git,
         upgrade_dependencies=not (args.no_deps or args.no_install),
         check_only=args.check_only,

@@ -163,6 +163,111 @@ def test_in_virtualenv_is_a_bool() -> None:
     assert isinstance(updater.in_virtualenv(), bool)
 
 
+def test_python_env_accepts_key_values_or_a_plain_path(tmp_path: Path) -> None:
+    env_file = tmp_path / "python.env"
+    env_file.write_text(
+        "# portable runtime\r\nexport 2PY2 = '../portable python/python3'\r\n",
+        encoding="utf-8",
+    )
+    assert updater.python_env_values(tmp_path) == {
+        "2PY2": str(tmp_path / "../portable python/python3")
+    }
+
+    env_file.write_text('"../portable python/python3"\n', encoding="utf-8")
+    assert updater.python_env_values(tmp_path) == {
+        "PYTHON": str(tmp_path / "../portable python/python3")
+    }
+
+
+def test_python_path_expansion_keeps_bare_commands_and_roots_relative_paths(
+    tmp_path: Path,
+) -> None:
+    assert updater.expand_interpreter_path("python3", tmp_path) == "python3"
+    assert updater.expand_interpreter_path("py -3", tmp_path) == "py -3"
+    assert updater.expand_interpreter_path("./portable/python.exe", tmp_path) == str(
+        tmp_path / "./portable/python.exe"
+    )
+    local_python = tmp_path / "python3"
+    local_python.touch()
+    assert updater.expand_interpreter_path("python3", tmp_path) == str(local_python)
+    assert updater.version_at_least("3.11.0")
+    assert not updater.version_at_least("3.10.14")
+    assert not updater.version_at_least("not-python")
+
+
+def test_configured_python_path_with_spaces_is_probed_as_one_executable(
+    tmp_path: Path,
+) -> None:
+    if os.name == "nt":
+        pytest.skip("a portable executable copy is platform-specific")
+    spaced_dir = tmp_path / "portable python"
+    spaced_dir.mkdir()
+    executable = spaced_dir / "my python"
+    executable.symlink_to(sys.executable)
+
+    candidate = updater.PythonCandidate(
+        str(executable), "python.env (PYTHON)", explicit=True
+    )
+    updater.probe_python(candidate)
+
+    assert candidate.usable, candidate.reason
+    assert candidate.version == ".".join(map(str, sys.version_info[:3]))
+    assert candidate.executable
+
+
+def test_python_resolution_prefers_the_project_file_and_reports_fallbacks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("DISKFREE_PYTHON", raising=False)
+    monkeypatch.setenv("2PY2", sys.executable)
+    (tmp_path / "python.env").write_text(
+        f'PYTHON="{sys.executable}"\n', encoding="utf-8"
+    )
+
+    selected, tried = updater.resolve_python(tmp_path)
+    assert selected is not None and selected.usable
+    assert selected.source == "python.env (PYTHON)"
+    assert tried[0].path == sys.executable
+
+    (tmp_path / "python.env").write_text(
+        "DISKFREE_PYTHON=./missing/portable-python\n", encoding="utf-8"
+    )
+    selected, tried = updater.resolve_python(tmp_path)
+    assert selected is not None and selected.source == "2PY2 (environment)"
+    warnings = updater.python_warnings(tried)
+    assert len(warnings) == 1 and "does not exist" in warnings[0]
+
+
+def test_python_resolution_honours_diskfree_python_before_the_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("DISKFREE_PYTHON", sys.executable)
+    (tmp_path / "python.env").write_text(
+        "2PY2=/missing/python\n", encoding="utf-8"
+    )
+
+    selected, _ = updater.resolve_python(tmp_path)
+    assert selected is not None
+    assert selected.source == "DISKFREE_PYTHON (environment)"
+
+
+def test_relative_2py2_environment_path_is_project_relative(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if os.name == "nt":
+        pytest.skip("a portable executable copy is platform-specific")
+    monkeypatch.delenv("DISKFREE_PYTHON", raising=False)
+    portable = tmp_path / "runtime with spaces" / "second python"
+    portable.parent.mkdir()
+    portable.symlink_to(sys.executable)
+    monkeypatch.setenv("2PY2", "./runtime with spaces/second python")
+
+    selected, _ = updater.resolve_python(tmp_path)
+    assert selected is not None and selected.usable
+    assert selected.source == "2PY2 (environment)"
+    assert selected.path == str(portable)
+
+
 def test_missing_dependencies_detects_an_absent_package(tmp_path: Path) -> None:
     probe_python = tmp_path / "probe.py"
     _write(probe_python, "print('hello')\n")
@@ -336,6 +441,38 @@ def test_a_branch_that_only_exists_locally_is_reported_honestly(
     assert report.changed is False
     assert "does not exist" in steps(report)["git update"].detail
     assert updater.read_version(clone) == "0.1.0"
+
+
+def test_default_update_tracks_the_diskfree_development_branch_and_check_does_not_switch(
+    repos: dict[str, Path],
+) -> None:
+    seed = repos["seed"]
+    branch = updater.DEFAULT_BRANCH
+    assert branch == "arena/0392f96c-diskfree"
+    _git(seed, "switch", "-c", branch)
+    make_package(seed, "0.9.0")
+    _git(seed, "commit", "-aqm", "DiskFree implementation branch")
+    _git(seed, "push", "-q", "origin", branch)
+    _git(seed, "switch", "-q", "main")
+    clone = repos["clone"]
+
+    check = updater.update(_options(clone, ("--check", "--no-deps")))
+    assert check.ok
+    assert check.branch == "main", "--check must not change the checked-out branch"
+    assert check.tracked_branch == branch
+    assert updater.read_version(clone) == "0.1.0"
+    assert _git(clone, "rev-parse", "--abbrev-ref", "HEAD") == "main"
+    assert steps(check)["switch branch"].skipped
+    assert "would switch main" in steps(check)["switch branch"].detail
+    assert steps(check)["git update"].skipped
+    assert check.commits_available == 1
+
+    report = updater.update(_options(clone, ("--no-deps",)))
+    assert report.ok, [step.as_dict() for step in report.steps if not step.ok]
+    assert report.branch == branch
+    assert report.tracked_branch == branch
+    assert updater.read_version(clone) == "0.9.0"
+    assert _git(clone, "rev-parse", "--abbrev-ref", "HEAD") == branch
 
 
 def test_switching_to_a_published_branch(repos: dict[str, Path]) -> None:
@@ -524,6 +661,55 @@ def test_the_shell_launcher_runs_the_updater(repos: dict[str, Path]) -> None:
     assert data["root"] == str(repos["clone"].resolve())
 
 
+def test_the_shell_launcher_reads_python_env_and_2py2(
+    tmp_path: Path,
+) -> None:
+    launcher_source = REPO_ROOT / "updater.sh"
+    if os.name == "nt" or not launcher_source.is_file():
+        pytest.skip("the POSIX shell launcher is not runnable here")
+
+    root = tmp_path / "DiskFree checkout"
+    (root / "diskfree").mkdir(parents=True)
+    shutil.copy2(REPO_ROOT / "diskfree/updater.py", root / "diskfree/updater.py")
+    launcher = root / "updater.sh"
+    shutil.copy2(launcher_source, launcher)
+    launcher.chmod(launcher.stat().st_mode | 0o111)
+
+    env = dict(os.environ)
+    env.pop("DISKFREE_PYTHON", None)
+    env.pop("2PY2", None)
+    portable_dir = root / "portable Python with spaces"
+    portable_dir.mkdir()
+    portable_python = portable_dir / "python3"
+    portable_python.symlink_to(sys.executable)
+    (root / "python.env").write_text(f'"{portable_python}"\n', encoding="utf-8")
+    configured = subprocess.run(
+        [str(launcher), "--show-python"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+        env=env,
+    )
+    assert configured.returncode == 0, configured.stderr
+    assert "Selected" in configured.stdout and "python.env (PYTHON)" in configured.stdout
+
+    (root / "python.env").unlink()
+    env["2PY2"] = str(portable_python)
+    portable = subprocess.run(
+        [str(launcher), "--show-python"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+        env=env,
+    )
+    assert portable.returncode == 0, portable.stderr
+    assert "Selected" in portable.stdout and "2PY2 (environment)" in portable.stdout
+
+
 def test_the_windows_launcher_targets_the_same_module() -> None:
     launcher = REPO_ROOT / "updater.bat"
     if not launcher.is_file():
@@ -534,8 +720,10 @@ def test_the_windows_launcher_targets_the_same_module() -> None:
     assert "DISKFREE_PYTHON" in text
     assert "%*" in text, "arguments must be forwarded to the updater"
     assert "exit /b" in text, "the exit code must be propagated"
-    # It must find an interpreter the way Windows users actually have one.
-    assert "py -3" in text and "where python" in text
+    # It must support both ordinary names and portable interpreter overrides.
+    assert "py -3" in text and 'where "%PY_EXE%"' in text
+    assert "python.env" in text and "2PY2" in text
+    assert "PYTHON_CHECK" in text, "the launcher must reject Python older than 3.11"
 
 
 def test_the_updater_module_needs_no_third_party_imports() -> None:

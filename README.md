@@ -178,19 +178,49 @@ safety flag leaves the safe setting in place, and no secret is ever echoed back 
 ```bash
 ./updater.sh              # Linux / macOS
 updater.bat               # Windows
-./updater.sh --check      # what would change? touches nothing
+./updater.sh --check      # fetches remote refs, but leaves checkout/dependencies untouched
 ./updater.sh --json       # machine-readable report
 ```
 
 or, from an installed checkout:
 
 ```bash
-diskfree update [--check] [--branch main] [--no-deps] [--json]
+diskfree update [--check] [--branch BRANCH] [--no-deps] [--json]
 ```
 
 `updater.sh` and `updater.bat` are thin launchers for `diskfree/updater.py`, which
 uses nothing but the standard library — so updating works even when DiskFree's own
-dependencies are missing or broken.
+dependencies are missing or broken. By default it updates from
+`origin/arena/0392f96c-diskfree`, the branch containing the product; use
+`--branch BRANCH` to follow another branch explicitly.
+
+### Choosing Python
+
+The updater checks for a usable Python 3.11+ interpreter in this order:
+
+1. `--python PATH`
+2. `DISKFREE_PYTHON` environment variable
+3. `python.env` in the project root — `DISKFREE_PYTHON`, `PYTHON`, or `2PY2`
+4. the environment variable named `2PY2` ("second Python", not Python 2)
+5. `.venv` or `venv` inside the project, then the running interpreter / platform
+   launchers and `python3` on `PATH`
+
+`python.env` accepts a simple one-line path (relative paths are rooted at the
+project), or a `KEY=VALUE` entry. For example:
+
+```text
+# choose one of these forms
+./portable-python/bin/python3
+# or: DISKFREE_PYTHON=./portable-python/bin/python3
+# or: 2PY2=../portable-python/python.exe
+```
+
+On Linux and macOS, set `2PY2` for one run with
+`env 2PY2=/path/to/python3 ./updater.sh`; on Windows use
+`set "2PY2=C:\portable-python\python.exe"` before running `updater.bat`.
+`DISKFREE_PYTHON=/path/to/python3 ./updater.sh` (or `--python PATH`) works on all
+three platforms. `./updater.sh --show-python` displays the candidates and why any
+were rejected; add `--json` for machine-readable details.
 
 The updater fetches from `origin` and **fast-forwards only**. It refuses to pull over
 uncommitted changes, never runs `git reset --hard`, `git clean` or a rebase, never
@@ -205,7 +235,7 @@ running `diskfree serve`.
 
 ```bash
 pip install -e ".[test]"
-pytest -q                 # 525 tests
+pytest -q                 # 533 passed, 1 skipped
 ruff check .              # the lint policy lives in pyproject.toml
 ```
 
