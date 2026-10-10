@@ -1,0 +1,78 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "diskfree"
+version = "0.1.0"
+description = "AI powered disk manager and cleaner. Safe and efficient."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "DiskFree project" }]
+keywords = ["disk", "cleaner", "storage", "ai", "ollama", "cortex"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Web Environment",
+  "Framework :: FastAPI",
+  "Intended Audience :: End Users/Desktop",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: System :: Archiving :: Mirroring",
+  "Topic :: System :: Filesystems",
+]
+dependencies = [
+  "fastapi>=0.115,<1",
+  "httpx>=0.27,<1",
+  "pydantic>=2.7,<3",
+  "uvicorn[standard]>=0.30,<1",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8",
+  "pytest-asyncio>=0.24",
+  "ruff>=0.6",
+]
+
+[project.scripts]
+diskfree = "diskfree.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["diskfree"]
+# The WebUI assets live inside the package, so they ship with the wheel by
+# default; no force-include list is needed.
+artifacts = ["diskfree/webui/**"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+# Correctness first, then the mechanical rules that keep a 10k-line codebase
+# consistent. Deliberately not selected: opinion-only families (D, ANN, TRY,
+# EM, PT...) that would churn the code without changing its behaviour.
+select = ["E", "W", "F", "I", "B", "C4", "UP", "SIM", "RUF"]
+ignore = [
+  "SIM108",   # a ternary is not always clearer than an if/else
+  # The core enums stay `(str, Enum)`: `str(Risk.SAFE)` must keep printing
+  # "Risk.SAFE" while `.value` prints "safe". Switching to StrEnum would change
+  # the text of every message that interpolates a member, for no gain.
+  "UP042",
+  "SIM105",   # the try/except/pass blocks that guard a scan are deliberate and commented
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]
+"diskfree/api/*" = ["B008"]   # Depends()/Query() in a default is the FastAPI idiom
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Query", "fastapi.Path"]
