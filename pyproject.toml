@@ -9,7 +9,7 @@ description = "AI powered disk manager and cleaner. Safe and efficient."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-authors = [{ name = "DiskFree project" }]
+authors = [{ name = "codero-sus" }]
 keywords = ["disk", "cleaner", "storage", "ai", "ollama", "cortex"]
 classifiers = [
   "Development Status :: 4 - Beta",
@@ -30,6 +30,11 @@ dependencies = [
   "pydantic>=2.7,<3",
   "uvicorn[standard]>=0.30,<1",
 ]
+
+[project.urls]
+Homepage = "https://the-codero.web.app/"
+GitHub = "https://github.com/codero-sus/DiskFree"
+Author = "https://github.com/codero-sus"
 
 [project.optional-dependencies]
 test = [

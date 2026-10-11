@@ -111,6 +111,10 @@ def test_the_webui_is_served(client: TestClient) -> None:
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/html")
     assert "DiskFree" in response.text
+    assert 'name="author" content="codero-sus"' in response.text
+    assert "Made with" in response.text
+    assert "https://github.com/codero-sus" in response.text
+    assert "https://the-codero.web.app/" in response.text
 
     for path, expected in (
         ("/app.js", "javascript"),
