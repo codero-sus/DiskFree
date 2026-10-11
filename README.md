@@ -6,6 +6,12 @@ DiskFree finds what is eating your disk, explains it in plain language, and remo
 only what you confirm — into the trash, with a journal, so every cleanup is one click
 from being undone.
 
+## Author & credits
+
+Made with ❤️ by [codero-sus](https://github.com/codero-sus).
+
+Project website: <https://the-codero.web.app/>.
+
 It is built around two local LLM hosts, [Cortex LLMHoster](https://github.com/codero-sus/Cortex_LLMHoster)
 and [Ollama](https://ollama.com), and it stays fully useful when neither is running:
 a deterministic rule engine does the analysis offline.

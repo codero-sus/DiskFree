@@ -3,16 +3,22 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>DiskFree — AI powered disk manager and cleaner</title>
+<title>DiskFree — space with confidence</title>
 <meta name="description" content="Safe, efficient disk cleaning with local AI advice. Read-only scans, reversible removals, nothing leaves your machine.">
+<meta name="author" content="codero-sus">
+<meta name="theme-color" content="#07110f">
+<meta property="og:title" content="DiskFree — space with confidence">
+<meta property="og:description" content="A safe, local-first disk manager. Your data stays yours.">
+<meta property="og:url" content="https://the-codero.web.app/">
 <meta name="color-scheme" content="dark light">
 <link rel="stylesheet" href="/styles.css">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 </head>
 <body>
+<a class="skip-link" href="#main-content">Skip to content</a>
 <div id="app">
 
-  <aside class="sidebar">
+  <aside class="sidebar" id="sidebar">
     <div class="brand">
       <span class="brand-mark" aria-hidden="true">
         <svg viewBox="0 0 32 32" width="26" height="26" aria-hidden="true">
@@ -48,16 +54,34 @@
         <div class="meter-label"><span id="sidebar-meter-text">checking disk…</span></div>
       </div>
       <div class="provider-strip" id="provider-strip"></div>
+      <div class="sidebar-credit">
+        <p>Made with <span aria-label="love">❤️</span> by
+          <a href="https://github.com/codero-sus" target="_blank" rel="noopener noreferrer">codero-sus</a>
+        </p>
+        <a class="credit-site" href="https://the-codero.web.app/" target="_blank" rel="noopener noreferrer">
+          Visit the website <span aria-hidden="true">↗</span>
+        </a>
+      </div>
     </div>
   </aside>
+  <button class="nav-backdrop" id="nav-backdrop" type="button" aria-label="Close navigation"></button>
 
-  <main class="main">
+  <main class="main" id="main-content" tabindex="-1">
     <header class="topbar">
       <div class="topbar-title">
-        <h1 id="view-title">Overview</h1>
-        <p id="view-subtitle">Your disk at a glance.</p>
+        <button class="icon-btn menu-toggle" id="btn-menu" type="button" aria-label="Open navigation"
+                aria-controls="sidebar" aria-expanded="false">
+          <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+            <path d="M4 6h16M4 12h16M4 18h16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+          </svg>
+        </button>
+        <div>
+          <h1 id="view-title">Overview</h1>
+          <p id="view-subtitle">Your disk at a glance.</p>
+        </div>
       </div>
       <div class="topbar-actions">
+        <span class="privacy-stamp"><span class="privacy-dot"></span>LOCAL ONLY</span>
         <span class="pill" id="pill-readonly" hidden title="DiskFree cannot modify anything">read-only</span>
         <span class="pill" id="pill-scan" hidden>scan idle</span>
         <button class="btn btn-ghost" id="btn-quick-scan" title="Scan your home directory">Quick scan</button>

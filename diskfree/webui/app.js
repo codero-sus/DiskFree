@@ -169,6 +169,8 @@
     chat: [],
     chatBusy: false,
     scanTimer: null,
+    statusTimer: null,
+    shellWired: false,
     acknowledged: false,
   };
 
@@ -227,6 +229,18 @@
   }
 
   // ------------------------------------------------------------ navigation
+  function setNavOpen(open) {
+    const wasOpen = document.body.classList.contains('nav-open');
+    document.body.classList.toggle('nav-open', Boolean(open));
+    const menu = $('#btn-menu');
+    if (menu) {
+      menu.setAttribute('aria-expanded', String(Boolean(open)));
+      menu.setAttribute('aria-label', open ? 'Close navigation' : 'Open navigation');
+    }
+    if (open) $$('.nav-item')[0]?.focus();
+    else if (wasOpen) menu?.focus();
+  }
+
   function navigate(view, opts = {}) {
     if (!VIEW_META[view]) view = 'overview';
     state.view = view;
@@ -235,7 +249,7 @@
     const [title, subtitle] = VIEW_META[view];
     $('#view-title').textContent = title;
     $('#view-subtitle').textContent = subtitle;
-    document.body.classList.remove('nav-open');
+    setNavOpen(false);
     render(view, opts);
   }
 
@@ -291,6 +305,7 @@
     const safeBytes = summary.safe_bytes || 0;
 
     host.innerHTML = `
+      ${overviewHero(status, job)}
       <div class="grid side">
         <div>
           <div class="card">
@@ -328,6 +343,63 @@
       </div>`;
 
     wireOverview(host);
+  }
+
+  function overviewHero(status, job) {
+    const complete = job && job.status === 'completed';
+    const running = job && job.status === 'running';
+    const onlineHosts = (status.providers || []).filter((provider) => provider.online).length;
+    const metric = complete ? bytes(job.actionable_bytes || 0) : running ? 'Scanning…' : '—';
+    const metricNote = complete
+      ? `${num(job.actionable_findings || 0)} reviewable items found`
+      : running ? 'Your files are being checked read-only' : 'Run a scan to find safe opportunities';
+    const action = complete ? 'goto-findings' : running ? 'goto-scan' : 'scan-balanced';
+    const actionLabel = complete ? 'Review your findings' : running ? 'View scan progress' : 'Start a safe scan';
+    const statusLabel = complete ? 'LATEST SCAN READY' : running ? 'SCAN IN PROGRESS' : 'PRIVATE BY DESIGN';
+    const engineLabel = onlineHosts
+      ? `${onlineHosts} local model host${onlineHosts === 1 ? '' : 's'} connected`
+      : 'Offline advice is ready';
+
+    return `<section class="hero" aria-labelledby="hero-title">
+      <div class="hero-grid-glow" aria-hidden="true"></div>
+      <div class="hero-copy">
+        <div class="hero-kicker"><span class="hero-live-dot"></span>DISKFREE <span class="hero-kicker-sep">/</span> LOCAL-FIRST DISK CARE</div>
+        <h2 id="hero-title">Make space for<br><span>what matters.</span></h2>
+        <p>Know what is taking up room. Understand every recommendation.
+          Keep control of what leaves your disk.</p>
+        <div class="hero-actions">
+          <button class="btn btn-primary hero-primary" data-act="${action}">
+            <svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">
+              <path d="M12 4v16M4 12h16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+            </svg>${actionLabel}<span class="hero-button-arrow" aria-hidden="true">↗</span>
+          </button>
+          <button class="btn btn-glass" data-act="goto-safety">Explore safety</button>
+        </div>
+        <div class="hero-trust-row">
+          <span><i aria-hidden="true">✓</i> Read-only scans</span>
+          <span><i aria-hidden="true">✓</i> Reversible cleanup</span>
+          <span><i aria-hidden="true">✓</i> ${esc(engineLabel)}</span>
+        </div>
+      </div>
+      <div class="hero-visual" aria-hidden="true">
+        <div class="hero-orbit orbit-one"></div>
+        <div class="hero-orbit orbit-two"></div>
+        <div class="hero-orbit orbit-three"></div>
+        <div class="hero-orbit-point point-one"></div>
+        <div class="hero-orbit-point point-two"></div>
+        <div class="hero-emblem">
+          <svg viewBox="0 0 88 88" width="82" height="82">
+            <circle cx="44" cy="44" r="37" fill="none" stroke="currentColor" stroke-width="1.5" opacity=".22"/>
+            <path d="M44 12 68 22v18c0 17-10 28-24 36C30 68 20 57 20 40V22z" fill="rgba(91,245,179,.11)" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+            <path d="m33 43 7 7 15-16" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </div>
+        <div class="hero-float-chip chip-private"><span></span>YOUR DATA STAYS HERE</div>
+        <div class="hero-float-chip chip-reclaim"><small>SPACE TO RECLAIM</small><strong>${esc(metric)}</strong><span>${esc(metricNote)}</span></div>
+        <div class="hero-state-tag"><span></span>${statusLabel}</div>
+      </div>
+      <div class="hero-bottom-line"><span>SAFE BY DESIGN</span><span class="hero-bottom-dash"></span><span>YOU DECIDE. ALWAYS.</span></div>
+    </section>`;
   }
 
   function donut(pct, value, label) {
@@ -437,16 +509,19 @@
   }
 
   function wireOverview(host) {
+    if (host.dataset.overviewWired === 'true') return;
+    host.dataset.overviewWired = 'true';
     host.addEventListener('click', (event) => {
       const button = event.target.closest('[data-act]');
       if (!button) return;
       const action = button.dataset.act;
-      if (action === 'scan-balanced') { startScan({ preset: 'balanced' }); }
+      if (action === 'scan-balanced') startScan({ preset: 'balanced' });
       if (action === 'goto-advisor') navigate('advisor');
       if (action === 'goto-findings') navigate('findings');
       if (action === 'goto-rules') navigate('rules');
       if (action === 'goto-safety') navigate('safety');
-    }, { once: true });
+      if (action === 'goto-scan') navigate('scan');
+    });
   }
 
   // ------------------------------------------------------------------ scan
@@ -1847,7 +1922,26 @@ DISKFREE_PROVIDER=auto</span>
         <div class="card-head"><h2>Environment</h2></div>
         <div class="card-body"><div class="logbox">${Object.entries(config.environment || {})
           .map(([key, value]) => `${esc(key)}=${esc(value)}`).join('\n') || '(no DISKFREE_* variables set)'}</div></div>
-      </div>`;
+      </div>
+
+      <section class="credits-card">
+        <div class="credits-mark" aria-hidden="true">D<span>·</span>F</div>
+        <div class="credits-copy">
+          <div class="credits-eyebrow">AUTHOR · PROJECT CREDITS</div>
+          <h2>Made with <span class="heart" aria-label="love">❤️</span> by
+            <a href="https://github.com/codero-sus" target="_blank" rel="noopener noreferrer">codero-sus</a>
+          </h2>
+          <p>Built with care for local-first, reversible disk cleanup.</p>
+        </div>
+        <div class="credits-links">
+          <a class="btn btn-glass" href="https://github.com/codero-sus" target="_blank" rel="noopener noreferrer">
+            GitHub <span aria-hidden="true">↗</span>
+          </a>
+          <a class="btn btn-primary" href="https://the-codero.web.app/" target="_blank" rel="noopener noreferrer">
+            Website <span aria-hidden="true">↗</span>
+          </a>
+        </div>
+      </section>`;
 
     host.querySelectorAll('[data-copy]').forEach((button) => {
       button.addEventListener('click', () => copyText(button.dataset.copy, button));
@@ -1939,6 +2033,12 @@ DISKFREE_PROVIDER=auto</span>
   }
 
   function wireShell() {
+    if (state.shellWired) return;
+    state.shellWired = true;
+    $('#btn-menu').addEventListener('click', () => {
+      setNavOpen(!document.body.classList.contains('nav-open'));
+    });
+    $('#nav-backdrop').addEventListener('click', () => setNavOpen(false));
     $('#nav').addEventListener('click', (event) => {
       const item = event.target.closest('.nav-item');
       if (item) navigate(item.dataset.view);
@@ -1947,7 +2047,10 @@ DISKFREE_PROVIDER=auto</span>
     $('#btn-advise').addEventListener('click', () => navigate('advisor'));
     $('#modal').addEventListener('close', closeModal);
     document.addEventListener('keydown', (event) => {
-      if (event.key === 'Escape') closeModal();
+      if (event.key === 'Escape') {
+        closeModal();
+        setNavOpen(false);
+      }
       if ((event.key === 'k' || event.key === 'K') && (event.metaKey || event.ctrlKey)) {
         event.preventDefault();
         navigate('findings');
@@ -1973,11 +2076,13 @@ DISKFREE_PROVIDER=auto</span>
       if (state.status) state.status.disks = disks;
     } catch { /* optional */ }
     navigate(state.view);
-    setInterval(() => {
-      if (!state.scanTimer) refreshStatus().then(() => {
-        if (state.view === 'overview') renderOverview($('#view-overview'));
-      }).catch(() => {});
-    }, 20000);
+    if (!state.statusTimer) {
+      state.statusTimer = setInterval(() => {
+        if (!state.scanTimer) refreshStatus().then(() => {
+          if (state.view === 'overview') renderOverview($('#view-overview'));
+        }).catch(() => {});
+      }, 20000);
+    }
     updateBadges();
   }
 
