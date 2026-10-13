@@ -121,14 +121,17 @@ def test_hard_links_are_not_reported_as_duplicates(
     assert str(fake_home["hardlink_source"]) not in reported
 
 
-def test_large_files_are_information_only(scan_result: ScanResult, fake_home: FakeHome) -> None:
+def test_large_files_are_high_risk_and_user_review_only(
+    scan_result: ScanResult, fake_home: FakeHome
+) -> None:
     findings = by_rule(scan_result, "large-files")
     assert findings, "the 900 MB video should be reported"
     finding = next(f for f in findings if f.path == str(fake_home["big_file"]))
-    assert finding.actionable is False, "DiskFree never proposes deleting somebody's video"
+    assert finding.actionable is True, "the user may explicitly choose a scanned file"
+    assert finding.as_dict()["selectable"] is True
     assert finding.default_selected is False
     assert finding.risk is Risk.HIGH
-    assert finding.extra.get("informational") is True
+    assert finding.extra.get("user_review_only") is True
 
 
 def test_old_downloads_are_high_risk_and_unselected(

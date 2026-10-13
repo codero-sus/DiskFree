@@ -788,8 +788,8 @@ DEFAULT_RULES: tuple[Rule, ...] = (
     ),
     _rule(
         "large-files", Category.LARGE_FILES, "Largest files",
-        "The biggest files found during the scan, for information. DiskFree never "
-        "selects these automatically.",
+        "The biggest files found during the scan. Always high-risk and never "
+        "pre-selected; the user may explicitly review and choose individual files.",
         Risk.HIGH, default_selected=False, computed=True,
         priority=95
     ),

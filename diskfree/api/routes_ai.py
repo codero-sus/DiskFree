@@ -110,17 +110,35 @@ async def advise(request: AdviseRequest, state: AppState = Depends(get_state)) -
         )
     assert job.result is not None
 
+    instructions = request.instructions.strip() if request.instructions else None
+    if instructions and (not request.use_model or request.provider == ENGINE_HEURISTIC):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "Custom cleanup instructions need a local language model.",
+                "hint": (
+                    "Select Auto, Cortex or Ollama. The offline rule engine cannot "
+                    "interpret chat instructions."
+                ),
+            },
+        )
+
     use_model = request.use_model and request.provider != ENGINE_HEURISTIC
     advice = await state.advisor.advise(
         job.result,
         provider=None if request.provider == "auto" else request.provider,
         model=request.model,
+        instructions=instructions,
         use_model=use_model,
         max_findings=request.max_findings,
     )
-    state.jobs.set_advice(job.id, advice.as_dict())
     payload = advice.as_dict()
     payload["job_id"] = job.id
+    payload["custom_instructions_requested"] = bool(instructions)
+    payload["custom_instructions_processed"] = bool(
+        instructions and advice.engine != ENGINE_HEURISTIC and not advice.fallback_used
+    )
+    state.jobs.set_advice(job.id, payload)
     return payload
 
 

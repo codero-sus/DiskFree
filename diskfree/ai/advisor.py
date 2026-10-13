@@ -62,6 +62,7 @@ class Advisor:
         *,
         provider: str | None = None,
         model: str | None = None,
+        instructions: str | None = None,
         use_model: bool = True,
         max_findings: int | None = None,
     ) -> Advice:
@@ -118,6 +119,8 @@ class Advisor:
         used_model = model or getattr(info, "default_model", None)
 
         payload_kwargs = {"max_findings": max_findings} if max_findings else {}
+        if instructions and instructions.strip():
+            payload_kwargs["instructions"] = instructions.strip()
         prompt: PromptPayload = build_payload(result, **payload_kwargs)
         started = time.perf_counter()
         try:

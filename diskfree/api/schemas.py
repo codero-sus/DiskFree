@@ -40,6 +40,7 @@ class AdviseRequest(BaseModel):
     job_id: str | None = None
     provider: Literal["auto", "cortex", "ollama", "heuristic"] = "auto"
     model: str | None = Field(default=None, max_length=200)
+    instructions: str | None = Field(default=None, max_length=4000)
     use_model: bool = True
     max_findings: int | None = Field(default=None, ge=1, le=400)
 

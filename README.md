@@ -48,10 +48,19 @@ ever contacted; the AI backends are local.
 ## The WebUI
 
 A dependency-free single-page app served by uvicorn, with ten views: Overview,
-Scan, Findings, Advisor, Clean, History, Assistant (streaming chat), Rules,
-Safety and Settings. Every dynamic string is escaped, security headers
-(CSP, `X-Frame-Options`, `nosniff`) are set on every response, and the API can be
-put behind a token with `DISKFREE_UI_TOKEN`.
+Scan, Findings, Advisor, Clean, History, Cleanup Chat, Rules, Safety and Settings.
+In Cleanup Chat, describe what file types to clear and what to keep; the selected
+local model matches those preferences against findings from the latest completed
+scan. AI picks are staged for review only. Personal and higher-risk items are never
+pre-selected, and nothing moves until you inspect an itemized plan and explicitly
+confirm it. Chat can consider any file type the scan found; scan a path or run a
+deeper scan first if the item is missing. Every dynamic string is escaped, security
+headers (CSP, `X-Frame-Options`, `nosniff`) are set on every response, and the API can
+be put behind a token with `DISKFREE_UI_TOKEN`.
+
+The top-bar model picker selects Auto, an installed Cortex/Ollama model, or the
+offline rule engine. Custom chat instructions require an online local language model;
+the offline rules never pretend to have interpreted them.
 
 ## Command line
 
