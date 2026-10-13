@@ -813,10 +813,11 @@ class Scanner:
                     age_days=max(0.0, (time.time() - mtime) / 86400) if mtime else 0.0,
                     root="",
                     tier=tier,
-                    # Large files are information only: never actionable.
-                    actionable=False,
+                    # Explicitly selectable for review, but never pre-selected.
+                    # Their high risk keeps model advice in the review bucket.
+                    actionable=True,
                     default_selected=False,
-                    extra={"tier_reason": reason or "", "informational": True},
+                    extra={"tier_reason": reason or "", "user_review_only": True},
                 )
             )
 

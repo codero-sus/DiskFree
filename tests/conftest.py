@@ -145,7 +145,7 @@ def build_fake_home(root: Path) -> FakeHome:
     os.link(p["hardlink_source"], root / "data/link.bin")
     p["hardlink_copy"] = root / "data/link.bin"
 
-    # --- a large file (information only) ---
+    # --- a large file (high-risk, user review only) ---
     p["big_file"] = _write(root / "Videos/movie.mkv", 900 * MB, age_days=200)
 
     # --- a symlink that must never be followed or removed ---

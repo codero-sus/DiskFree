@@ -210,6 +210,18 @@ def test_payload_lists_the_findings_the_model_may_reference(
     assert {item["id"] for item in findings_in_payload} == set(payload.finding_ids)
 
 
+def test_payload_carries_user_cleanup_preferences_separately_from_findings(
+    scan_result: ScanResult,
+) -> None:
+    instructions = "Clear browser caches, but keep my photos and Downloads."
+    payload = build_payload(scan_result, instructions=instructions)
+    assert payload.data["user_instructions"] == instructions
+    assert instructions in payload.user
+    assert "user_instructions" in payload.system
+    assert "run a relevant" in payload.system
+    assert "Never invent a finding or path" in payload.system
+
+
 def test_chat_context_is_compact_and_private(scan_result: ScanResult, fake_home) -> None:
     context = build_chat_context(scan_result, home=fake_home.root)
     assert str(fake_home.root) not in context
@@ -239,6 +251,31 @@ async def test_advisor_uses_the_model_when_one_answers(
     assert advice.headline.strip()
     assert advice.items
     assert advice.latency_ms is not None and advice.latency_ms >= 0
+    await advisor.aclose()
+
+
+async def test_advisor_sends_cleanup_preferences_to_the_selected_local_model(
+    settings: Settings, scan_result: ScanResult
+) -> None:
+    configured = Settings(
+        data_dir=settings.data_dir, safety=settings.safety, scan=settings.scan,
+        providers=(cortex_settings(),),
+    )
+    captured: list[dict[str, Any]] = []
+    responder = reply(model_advice(scan_result))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/chat/completions":
+            captured.append(json.loads(request.content))
+        return responder(request)
+
+    advisor = advisor_with(handler, configured)
+    instructions = "Clear browser caches; never select photos or Downloads."
+    advice = await advisor.advise(scan_result, instructions=instructions)
+
+    assert advice.fallback_used is False
+    assert captured
+    assert instructions in captured[0]["messages"][1]["content"]
     await advisor.aclose()
 
 

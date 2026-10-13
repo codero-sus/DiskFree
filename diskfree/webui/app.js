@@ -147,8 +147,30 @@
   }
 
   // ---------------------------------------------------------------- state
+  const MODEL_SELECTION_KEY = 'diskfree.ai-selection';
+  const savedModelSelection = (() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem(MODEL_SELECTION_KEY) || '{}');
+      const providers = ['auto', 'heuristic', 'cortex', 'ollama'];
+      return {
+        provider: providers.includes(saved.provider) ? saved.provider : 'auto',
+        model: typeof saved.model === 'string' ? saved.model.slice(0, 200) : '',
+      };
+    } catch {
+      return { provider: 'auto', model: '' };
+    }
+  })();
   const state = {
     view: 'overview',
+    providerChoice: savedModelSelection.provider,
+    modelChoice: savedModelSelection.model,
+    providersLoaded: false,
+    providersPromise: null,
+    cleanupInstructions: '',
+    chatSelectionAdvice: null,
+    chatSelectionIds: [],
+    chatSelectionBusy: false,
+    chatSelectionError: '',
     status: null,
     providers: [],
     presets: null,
@@ -181,7 +203,7 @@
     advisor: ['AI Advisor', 'Local-model analysis of the scan, checked by DiskFree\'s guardrails.'],
     clean: ['Clean', 'Itemise, confirm, then move data to the trash. Reversible.'],
     history: ['History', 'Every move DiskFree made, with one-click undo.'],
-    assistant: ['Assistant', 'Ask questions about your disk. Read-only by design.'],
+    assistant: ['Cleanup Chat', 'Tell the AI what to clear—and what to leave alone.'],
     rules: ['Rules', 'The full cleaning knowledge base, expanded for this machine.'],
     safety: ['Safety', 'What is protected, where removed data goes, and why.'],
     settings: ['Settings', 'Configuration, providers and limits.'],
@@ -532,6 +554,7 @@
     const presets = state.presets.presets || [];
     const home = state.presets.home || '';
     const job = state.job;
+    const defaultLargeFileMb = (presets.find((preset) => preset.id === 'balanced') || {}).large_file_min_mb || 250;
 
     host.innerHTML = `
       <div class="card">
@@ -555,7 +578,9 @@
               <label class="switch"><input type="checkbox" id="opt-duplicates" checked>
                 <span>Find duplicate files (hashes large files)</span></label>
               <label class="switch"><input type="checkbox" id="opt-large" checked>
-                <span>List the largest files (information only)</span></label>
+                <span>Find large files for AI/user review (never pre-selected)</span></label>
+              <label class="field"><span>Large files above (MB)</span>
+                <input type="number" id="opt-large-min" value="${esc(defaultLargeFileMb)}" min="1" step="1"></label>
               <label class="switch"><input type="checkbox" id="opt-advisories" checked>
                 <span>Report system space DiskFree will not touch</span></label>
               <label class="field"><span>Ignore findings smaller than (MB)</span>
@@ -592,11 +617,21 @@
         roots,
         find_duplicates: $('#opt-duplicates').checked,
         find_large_files: $('#opt-large').checked,
+        large_file_min_mb: Math.max(1, Number($('#opt-large-min').value || 1)),
         include_advisories: $('#opt-advisories').checked,
         min_finding_bytes: Math.max(0, Number($('#opt-minbytes').value || 0)) * 1048576,
         temp_min_age_days: Number($('#opt-temp-age').value || 0),
         log_min_age_days: Number($('#opt-log-age').value || 0),
         old_file_min_age_days: Number($('#opt-old-age').value || 1),
+      });
+    });
+    host.querySelectorAll('input[name="preset"]').forEach((radio) => {
+      radio.addEventListener('change', () => {
+        const selected = presets.find((preset) => preset.id === radio.value);
+        const threshold = $('#opt-large-min');
+        if (selected && threshold && selected.large_file_min_mb) {
+          threshold.value = String(selected.large_file_min_mb);
+        }
       });
     });
     $('#btn-scan-cancel').addEventListener('click', cancelScan);
@@ -611,7 +646,11 @@
       state.job = response.job;
       state.selection.clear();
       state.advice = null;
+      state.chatSelectionAdvice = null;
+      state.chatSelectionIds = [];
+      state.chatSelectionError = '';
       state.plan = null;
+      updateChatControls();
       toast('Scan started', `Job ${response.job.id}`);
       if (state.view !== 'scan') navigate('scan');
       else { paintScanProgress(); }
@@ -639,6 +678,7 @@
         const job = await API.get(`/api/scans/${encodeURIComponent(state.jobId)}`);
         state.job = job;
         updateBadges();
+        updateChatControls();
         paintScanProgress();
         if (job.status === 'running' || job.status === 'queued') {
           if (state.view === 'overview') renderOverview($('#view-overview'));
@@ -1022,17 +1062,166 @@
     area.remove();
   }
 
+  // --------------------------------------------------------------- AI model picker
+  function modelChoiceValue(provider, model) {
+    return `${provider}|${encodeURIComponent(model || '')}`;
+  }
+
+  function parseModelChoice(value) {
+    const separator = value.indexOf('|');
+    const provider = separator < 0 ? 'auto' : value.slice(0, separator);
+    let model = '';
+    try { model = decodeURIComponent(separator < 0 ? '' : value.slice(separator + 1)); } catch { /* use the default */ }
+    return {
+      provider: ['auto', 'heuristic', 'cortex', 'ollama'].includes(provider) ? provider : 'auto',
+      model,
+    };
+  }
+
+  function modelChoices() {
+    const choices = [
+      { provider: 'auto', model: '', label: 'Auto · best available' },
+      { provider: 'heuristic', model: '', label: 'Rule engine · offline' },
+    ];
+    (state.providers || []).forEach((provider) => {
+      const models = [...new Set([
+        ...(provider.models || []),
+        ...(provider.running_models || []),
+        ...(provider.default_model ? [provider.default_model] : []),
+      ].filter(Boolean))].slice(0, 100);
+      const availability = provider.online ? '' : ' · offline';
+      if (!models.length) {
+        choices.push({
+          provider: provider.name,
+          model: '',
+          label: `${provider.label || provider.name} · server default${availability}`,
+        });
+      } else {
+        models.forEach((model) => choices.push({
+          provider: provider.name,
+          model,
+          label: `${provider.label || provider.name} · ${model}${availability}`,
+        }));
+      }
+    });
+    const selected = modelChoiceValue(state.providerChoice || 'auto', state.modelChoice || '');
+    if (!choices.some((choice) => modelChoiceValue(choice.provider, choice.model) === selected)) {
+      const provider = (state.providers || []).find((item) => item.name === state.providerChoice);
+      choices.push({
+        provider: state.providerChoice || 'auto',
+        model: state.modelChoice || '',
+        label: `${provider?.label || state.providerChoice} · ${state.modelChoice || 'saved selection'}${provider && !provider.online ? ' · offline' : ''}`,      });
+    }
+    return choices;
+  }
+
+  function renderModelSelector() {
+    const select = $('#model-select');
+    if (!select) return;
+    const choices = modelChoices();
+    select.innerHTML = choices.map((choice) =>
+      `<option value="${esc(modelChoiceValue(choice.provider, choice.model))}">${esc(choice.label)}</option>`
+    ).join('');
+    select.value = modelChoiceValue(state.providerChoice || 'auto', state.modelChoice || '');
+    select.title = `Selected: ${choices.find((choice) =>
+      modelChoiceValue(choice.provider, choice.model) === select.value)?.label || 'Auto'}`;
+    updateProviderCardSelection();
+    updateChatControls();
+  }
+
+  function updateProviderCardSelection() {
+    $$('[data-provider]').forEach((card) => {
+      card.classList.toggle('is-chosen', card.dataset.provider === state.providerChoice);
+    });
+  }
+
+  function setModelChoice(provider, model = '') {
+    if (state.chatSelectionBusy) {
+      toast('AI selection in progress', 'Wait for the current model response before changing models.', 'warn');
+      renderModelSelector();
+      return;
+    }
+    const nextProvider = provider || 'auto';
+    const nextModel = model || '';
+    if (state.chatSelectionAdvice
+        && (nextProvider !== state.providerChoice || nextModel !== state.modelChoice)) {
+      invalidateChatSelection();
+    }
+    state.providerChoice = nextProvider;
+    state.modelChoice = nextModel;
+    localStorage.setItem(MODEL_SELECTION_KEY, JSON.stringify({
+      provider: state.providerChoice,
+      model: state.modelChoice,
+    }));
+    renderModelSelector();
+  }
+
+  async function loadProviders(force = false) {
+    if (state.providersLoaded && !force) return state.providers;
+    if (state.providersPromise) return state.providersPromise;
+    const pending = API.get('/api/providers').then((data) => {
+      state.providers = data.providers || [];
+      state.providerMeta = data;
+      state.providersLoaded = true;
+      renderModelSelector();
+      return state.providers;
+    });
+    state.providersPromise = pending;
+    try {
+      return await pending;
+    } finally {
+      if (state.providersPromise === pending) state.providersPromise = null;
+    }
+  }
+
+  function selectedModelLabel() {
+    if (!state.providerChoice || state.providerChoice === 'auto') return 'Auto · best available';
+    if (state.providerChoice === 'heuristic') return 'Rule engine · offline';
+    const provider = (state.providers || []).find((item) => item.name === state.providerChoice);
+    return `${provider?.label || state.providerChoice}${state.modelChoice ? ` · ${state.modelChoice}` : ' · server default'}`;
+  }
+
+  function hasSelectedOnlineModel() {
+    if (state.providerChoice === 'heuristic') return false;
+    if (!state.providersLoaded) return true;
+    if (!state.providerChoice || state.providerChoice === 'auto') {
+      return state.providers.some((provider) => provider.online);
+    }
+    return Boolean(state.providers.find((provider) => provider.name === state.providerChoice)?.online);
+  }
+
+  function updateChatControls() {
+    const button = $('#btn-build-cleanup');
+    const hint = $('#chat-cleanup-status');
+    const send = $('#chat-send');
+    const input = $('#chat-text');
+    if (send) send.disabled = state.chatBusy || state.chatSelectionBusy;
+    if (input) input.disabled = state.chatSelectionBusy;
+    if (!button) return;
+    const hasInstruction = state.chat.some((message) =>
+      message.role === 'user' && String(message.text || '').trim()
+    );
+    const scanReady = state.job && state.job.status === 'completed';
+    const modelReady = hasSelectedOnlineModel();
+    button.disabled = Boolean(
+      !hasInstruction || !scanReady || state.chatBusy || state.chatSelectionBusy || !modelReady
+    );
+    if (hint) {
+      if (!scanReady) hint.textContent = 'Run a completed read-only scan before asking AI to select findings.';
+      else if (!hasInstruction) hint.textContent = 'Describe what to clear and what to keep, then build a reviewable selection.';
+      else if (!modelReady) hint.textContent = 'Choose an online local model above. The offline rules cannot interpret chat instructions.';
+      else if (state.chatSelectionBusy) hint.textContent = 'Matching your instructions to the latest scan…';
+      else hint.textContent = `Ready to ask ${selectedModelLabel()} to make a reviewable selection.`;
+    }
+  }
+
   // --------------------------------------------------------------- advisor
   async function renderAdvisor(host) {
-    if (!state.providers.length) {
-      try {
-        const data = await API.get('/api/providers');
-        state.providers = data.providers || [];
-        state.providerMeta = data;
-      } catch (error) {
-        host.innerHTML = errorCard(error);
-        return;
-      }
+    try {
+      await loadProviders();
+    } catch (error) {
+      host.innerHTML = errorCard(error);
+      return;
     }
     const providers = state.providers;
     const advice = state.advice;
@@ -1051,13 +1240,13 @@
             <strong>metadata only</strong> — paths, sizes, ages and categories — never file contents,
             and never your username (the home directory is written as <span class="mono">~</span>).</div>
         </div>
-        <div class="card-foot">
-          <div class="row-gap">
-            <label class="field" style="min-width:220px"><span>Model (optional override)</span>
-              <input type="text" id="advise-model" placeholder="auto" value="${esc(state.adviceModel || '')}"></label>
-            <label class="switch" style="margin-top:18px"><input type="checkbox" id="advise-use-model" checked>
-              <span>Use a model (otherwise the offline rule engine answers)</span></label>
-          </div>
+        <div class="card-foot advisor-controls">
+          <label class="field advisor-instructions"><span>Cleanup preferences (optional)</span>
+            <textarea id="advise-instructions" rows="2" maxlength="4000"
+              placeholder="Tell the AI what to clear—and what to keep.">${esc(state.cleanupInstructions || '')}</textarea>
+          </label>
+          <label class="switch advisor-use-model"><input type="checkbox" id="advise-use-model" checked>
+            <span>Use the selected local model</span></label>
           <button class="btn btn-primary" id="btn-run-advice" ${hasJob ? '' : 'disabled'}>
             ✦ ${advice ? 'Re-analyse' : 'Analyse scan'}</button>
         </div>
@@ -1074,22 +1263,25 @@
     const refresh = $('#btn-refresh-providers');
     if (refresh) refresh.addEventListener('click', async () => {
       state.providers = [];
-      await renderAdvisor($('#view-advisor'));
-      toast('Providers re-checked');
+      state.providersLoaded = false;
+      try {
+        await loadProviders(true);
+        await renderAdvisor($('#view-advisor'));
+        toast('Providers re-checked');
+      } catch (error) {
+        toast('Provider check failed', error.message, 'err');
+      }
     });
     host.querySelectorAll('[data-provider]').forEach((card) => {
       card.addEventListener('click', () => {
-        state.providerChoice = card.dataset.provider;
-        host.querySelectorAll('[data-provider]').forEach((other) => other.classList.remove('is-chosen'));
-        card.classList.add('is-chosen');
+        const provider = card.dataset.provider;
+        const info = state.providers.find((item) => item.name === provider);
+        setModelChoice(provider, info?.default_model || info?.running_models?.[0] || info?.models?.[0] || '');
       });
     });
     const nav = host.querySelector('[data-nav]');
     if (nav) nav.addEventListener('click', () => navigate(nav.dataset.nav));
-    if (state.providerChoice) {
-      const chosen = host.querySelector(`[data-provider="${state.providerChoice}"]`);
-      if (chosen) chosen.classList.add('is-chosen');
-    }
+    updateProviderCardSelection();
   }
 
   function providerCard(provider) {
@@ -1121,27 +1313,35 @@
 
   async function runAdvice() {
     if (!state.jobId) { toast('Scan first', 'Advice needs a completed scan', 'warn'); return; }
+    const useModel = ($('#advise-use-model') || {}).checked !== false;
+    const instructions = String(($('#advise-instructions') || {}).value || '').trim();
+    const provider = state.providerChoice || 'auto';
+    if (instructions && (!useModel || provider === 'heuristic')) {
+      toast('Choose a local model', 'Custom cleanup preferences need an online language model; the offline rules cannot interpret them.', 'warn');
+      return;
+    }
+    state.cleanupInstructions = instructions;
     const out = $('#advice-out');
-    if (out) out.innerHTML = `<div class="card"><div class="card-body">${spinner('Asking the local model…')}</div></div>`;
+    if (out) out.innerHTML = `<div class="card"><div class="card-body">${spinner('Asking the selected local model…')}</div></div>`;
     const button = $('#btn-run-advice');
     if (button) button.disabled = true;
-    const useModel = ($('#advise-use-model') || {}).checked !== false;
-    const model = ($('#advise-model') || {}).value || '';
-    state.adviceModel = model;
-    const provider = state.providerChoice || 'auto';
     try {
       const advice = await API.post('/api/advise', {
         job_id: state.jobId,
-        provider: provider === 'heuristic' ? 'heuristic' : provider,
-        model: model || null,
+        provider,
+        model: state.modelChoice || null,
+        instructions: instructions || null,
         use_model: useModel && provider !== 'heuristic',
       });
       state.advice = advice;
       state.adviceJobId = state.jobId;
       paintAdvice(advice);
       const engine = advice.engine === 'heuristic' ? 'offline rule engine' : `${advice.engine}${advice.model ? ' · ' + advice.model : ''}`;
-      toast('Advice ready', `${engine} · ${num((advice.items || []).length)} recommendations`,
-        advice.fallback_used ? 'warn' : 'ok');
+      const tailored = advice.custom_instructions_requested && !advice.custom_instructions_processed;
+      toast(tailored ? 'Preferences not applied' : 'Advice ready',
+        tailored ? 'The model was unavailable; this fallback did not use your cleanup instructions.'
+          : `${engine} · ${num((advice.items || []).length)} recommendations`,
+        tailored || advice.fallback_used ? 'warn' : 'ok');
     } catch (error) {
       if (out) out.innerHTML = errorCard(error);
       toast('Advice failed', error.message, 'err');
@@ -1160,6 +1360,7 @@
     const items = advice.items || [];
     const totals = advice.totals || {};
     const guardrails = advice.guardrails || [];
+    const instructionsFailed = advice.custom_instructions_requested && !advice.custom_instructions_processed;
     const cleanBytes = items.filter((i) => i.action === 'clean').reduce((s, i) => s + i.bytes, 0);
     const reviewBytes = items.filter((i) => i.action === 'review').reduce((s, i) => s + i.bytes, 0);
     const grouped = {};
@@ -1167,6 +1368,9 @@
     const order = ['clean', 'review', 'manual', 'keep'];
 
     return `
+      ${instructionsFailed ? `<div class="notice warn mb">
+        <strong>Your cleanup preferences were not processed by a model.</strong>
+        <p>This offline fallback is not tailored to your chat instructions. Select an online local model and try again; no AI selection was applied.</p></div>` : ''}
       ${advice.error ? `<div class="notice ${advice.fallback_used ? 'warn' : 'danger'} mb">
         <strong>${advice.fallback_used ? 'Model unavailable — offline rule engine answered' : 'Advice error'}.</strong>
         <p>${esc(advice.error)}</p>${advice.error_hint ? `<p class="hint">${esc(advice.error_hint)}</p>` : ''}</div>` : ''}
@@ -1192,10 +1396,10 @@
             <ul>${advice.warnings.map((w) => `<li>${esc(w)}</li>`).join('')}</ul></div>` : ''}
         </div>
         <div class="card-foot">
-          <span class="hint">Only safe and low risk items are ever pre-selected, whatever the model said.</span>
+          <span class="hint">Nothing is removed here. Only safe and low-risk picks can be pre-selected; review a separate plan before confirming.</span>
           <div class="row-gap">
             <button class="btn btn-ghost" id="btn-advice-goto">🧾 See in findings</button>
-            <button class="btn btn-primary" id="btn-advice-apply">Apply selection & plan</button>
+            <button class="btn btn-primary" id="btn-advice-apply" ${instructionsFailed ? 'disabled' : ''}>Apply selection & plan</button>
           </div>
         </div>
       </div>
@@ -1255,6 +1459,10 @@
     if (goto) goto.addEventListener('click', () => navigate('findings'));
     const apply = $('#btn-advice-apply');
     if (apply) apply.addEventListener('click', async () => {
+      if (state.advice?.custom_instructions_requested && !state.advice.custom_instructions_processed) {
+        toast('Preferences not applied', 'Choose an online local model and run the analysis again.', 'warn');
+        return;
+      }
       const ids = (state.advice && state.advice.clean_ids) || [];
       if (!ids.length) { toast('Nothing to apply', 'The advisor did not mark anything as safe to clean', 'warn'); return; }
       state.selection = new Set(ids);
@@ -1594,36 +1802,68 @@
     }
   }
 
-  // ------------------------------------------------------------- assistant
+  // ------------------------------------------------------------- cleanup chat
   function renderAssistant(host) {
-    const online = (state.providers || []).filter((p) => p.online);
+    const online = (state.providers || []).filter((provider) => provider.online);
     host.innerHTML = `
-      <div class="card">
-        <div class="card-head"><h2>Assistant</h2>
-          <span class="pill info">read-only · it cannot delete anything</span></div>
+      <div class="card cleanup-chat-card">
+        <div class="card-head"><div>
+          <h2>Cleanup Chat</h2>
+          <span class="sub">Tell the AI what to clear—and what to protect.</span>
+        </div><span class="pill ok">recommendations only · approval required</span></div>
         <div class="card-body">
+          <div class="notice ok cleanup-chat-notice">
+            <strong>Nothing is deleted by chat.</strong> Ask about any file type or folder, including personal files.
+            The AI can only match findings from your latest completed scan; run a scan that includes a path if it is missing.
+            Personal and higher-risk items stay unselected for your review.
+          </div>
+          <div class="chat-prompts" aria-label="Example cleanup instructions">
+            <button class="chip" data-chat-prompt="Suggest clearing regenerable caches and temporary files, but keep my photos, documents, and Downloads.">Caches, keep personal files</button>
+            <button class="chip" data-chat-prompt="Find large video, archive, and installer files for review. Do not select anything personal automatically.">Find large files to review</button>
+            <button class="chip" data-chat-prompt="Suggest removing build artifacts and package caches, but keep source projects and virtual environments.">Build files, keep projects</button>
+          </div>
           <div class="chat">
-            <div class="chat-log" id="chat-log"></div>
+            <div class="chat-log" id="chat-log" role="log" aria-live="polite" aria-label="Cleanup chat"></div>
             <div class="chat-input">
-              <textarea id="chat-text" rows="1"
-                placeholder="Ask about your disk… e.g. “Why is ~/.cache so big?” or “What is safest to clear first?”"></textarea>
+              <textarea id="chat-text" rows="2" maxlength="8000" aria-label="Cleanup chat message"
+                placeholder="Tell DiskFree what you want removed and what must stay…"></textarea>
               <button class="btn btn-primary" id="chat-send">Send</button>
             </div>
           </div>
-          <div class="hint mt">The assistant sees the same metadata the advisor sees — never file
-            contents. ${online.length ? `Answering via ${esc(online.map((p) => p.label).join(' or '))}.`
-            : 'No local model host is online, so start Cortex LLMHoster or Ollama to chat.'}</div>
+          <div class="chat-build-row">
+            <div class="chat-build-copy">
+              <strong>Turn this conversation into a selection</strong>
+              <span class="hint" id="chat-cleanup-status" aria-live="polite"></span>
+            </div>
+            <button class="btn btn-primary" id="btn-build-cleanup" disabled>✦ Build safe selection</button>
+          </div>
+          <div id="chat-selection-result" aria-live="polite">
+            ${state.chatSelectionAdvice ? chatSelectionResultHtml(state.chatSelectionAdvice) : ''}
+          </div>
+          <div class="hint mt">Chat and cleanup matching use the selected local model (${esc(selectedModelLabel())}).
+            DiskFree sends scan metadata, never file contents. ${online.length
+              ? `${esc(online.map((provider) => provider.label).join(' and '))} ${online.length === 1 ? 'is' : 'are'} online.`
+              : 'No model host is currently online; start Cortex LLMHoster or Ollama to use AI chat.'}</div>
         </div>
       </div>`;
     paintChat();
-    const text = $('#chat-text');
-    const send = $('#chat-send');
-    const submit = () => sendChat();
-    send.addEventListener('click', submit);
-    text.addEventListener('keydown', (event) => {
-      if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); submit(); }
+    host.querySelectorAll('[data-chat-prompt]').forEach((button) => {
+      button.addEventListener('click', () => {
+        const input = $('#chat-text');
+        input.value = button.dataset.chatPrompt;
+        input.focus();
+      });
     });
-    text.focus();
+    host.querySelectorAll('[data-chat-nav]').forEach((button) => {
+      button.addEventListener('click', () => navigate(button.dataset.chatNav));
+    });
+    $('#chat-send').addEventListener('click', sendChat);
+    $('#btn-build-cleanup').addEventListener('click', buildChatSelection);
+    $('#chat-text').addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); sendChat(); }
+    });
+    updateChatControls();
+    $('#chat-text').focus();
   }
 
   function paintChat() {
@@ -1634,28 +1874,148 @@
         <div class="who">${esc(message.role === 'user' ? 'You' : (message.who || 'DiskFree'))}</div>
         <div class="text">${esc(message.text)}${message.streaming ? ' ▌' : ''}</div>
       </div>`).join('') || `<div class="empty"><div class="big">💬</div>
-        <h3>Ask anything about your disk</h3>
-        <p>“What is using the most space?”, “Is it safe to clear the pip cache?”,
-        “Why can’t DiskFree clean /var/lib/docker?”</p></div>`;
+        <h3>What should DiskFree clear or keep?</h3>
+        <p>For example: “Suggest clearing browser caches, but keep Downloads and my photos.”
+          AI recommendations are reviewed before anything can be moved.</p></div>`;
     log.scrollTop = log.scrollHeight;
+  }
+
+  function chatSelectionResultHtml(advice) {
+    if (advice.custom_instructions_requested && !advice.custom_instructions_processed) {
+      return `<div class="notice warn chat-selection-result-card">
+        <strong>Your chat instructions were not processed by a model.</strong>
+        <p>${esc(advice.error_hint || advice.error || 'Choose an online local model and build the selection again.')}</p>
+        <p>These offline fallback suggestions are not tailored to your request, so nothing was selected.</p>
+      </div>`;
+    }
+    const items = advice.items || [];
+    const cleanIds = Array.isArray(advice.clean_ids) ? advice.clean_ids : [];
+    const reviewCount = items.filter((item) => item.action === 'review').length;
+    const manualCount = items.filter((item) => item.action === 'manual').length;
+    const keepCount = items.filter((item) => item.action === 'keep').length;
+    const noMatches = items.length === 0;
+    return `<div class="chat-selection-result-card">
+      <div class="chat-selection-heading"><span class="chat-result-check" aria-hidden="true">✓</span>
+        <div><strong>${noMatches ? 'No matching scan findings' : 'AI selection is ready to review'}</strong>
+          <span>${esc(advice.engine || 'local model')}${advice.model ? ` · ${esc(advice.model)}` : ''}</span></div>
+      </div>
+      ${advice.summary ? `<p class="chat-selection-summary">${esc(advice.summary)}</p>` : ''}
+      <div class="chat-selection-stats">
+        <div><strong>${num(cleanIds.length)}</strong><span>safe/low-risk item(s) selected for your review</span></div>
+        <div><strong>${num(reviewCount)}</strong><span>higher-risk item(s) flagged for a manual decision</span></div>
+        <div><strong>${num(keepCount)}</strong><span>matching item(s) kept as requested</span></div>
+        <div><strong>${num(manualCount)}</strong><span>system-owned item(s) DiskFree will not touch</span></div>
+      </div>
+      ${noMatches ? `<div class="notice warn mt"><strong>Nothing was invented or selected.</strong>
+        Run a relevant scan that includes the requested path or file type, then ask again.</div>` : ''}
+      <div class="notice ok mt"><strong>No files have been moved or deleted.</strong>
+        Review the findings, create an itemized plan, then explicitly confirm it to move items to trash.
+        Higher-risk and personal files are never pre-selected.</div>
+      <div class="row-gap mt">
+        ${noMatches ? '<button class="btn btn-primary" data-chat-nav="scan">Choose scan settings</button>' : '<button class="btn btn-primary" data-chat-nav="findings">Review selection in Findings</button>'}
+        <button class="btn btn-ghost" data-chat-nav="advisor">Full AI recommendations</button>
+      </div>
+    </div>`;
+  }
+
+  function invalidateChatSelection() {
+    state.chatSelectionIds.forEach((id) => state.selection.delete(id));
+    state.chatSelectionIds = [];
+    state.chatSelectionAdvice = null;
+    state.chatSelectionError = '';
+    const result = $('#chat-selection-result');
+    if (result) result.innerHTML = '';
+  }
+
+  async function buildChatSelection() {
+    if (state.chatSelectionBusy || !state.jobId || state.job?.status !== 'completed') {
+      toast('Complete a scan first', 'AI selection is based only on findings from a completed read-only scan.', 'warn');
+      return;
+    }
+    if (!hasSelectedOnlineModel()) {
+      toast('Choose an online local model', 'The offline rule engine cannot interpret custom chat instructions.', 'warn');
+      return;
+    }
+    const instructions = state.chat
+      .filter((message) => message.role === 'user' && String(message.text || '').trim())
+      .slice(-12)
+      .map((message, index) => `${index + 1}. ${String(message.text).trim()}`)
+      .join('\n')
+      .slice(-4000);
+    if (!instructions) {
+      toast('Add a cleanup instruction', 'Tell the AI what to clear and what to keep.', 'warn');
+      return;
+    }
+    invalidateChatSelection();
+    state.cleanupInstructions = instructions;
+    state.chatSelectionBusy = true;
+    const button = $('#btn-build-cleanup');
+    const result = $('#chat-selection-result');
+    if (button) button.disabled = true;
+    if (result) result.innerHTML = `<div class="card"><div class="card-body">${spinner('Matching your instructions to this scan…')}</div></div>`;
+    updateChatControls();
+    try {
+      const advice = await API.post('/api/advise', {
+        job_id: state.jobId,
+        provider: state.providerChoice || 'auto',
+        model: state.modelChoice || null,
+        instructions,
+        use_model: true,
+        max_findings: 400,
+      });
+      state.advice = advice;
+      state.adviceJobId = state.jobId;
+      state.chatSelectionAdvice = advice;
+      if (advice.custom_instructions_processed) {
+        state.chatSelectionIds = [...(advice.clean_ids || [])];
+        state.selection = new Set(state.chatSelectionIds);
+        state.chatSelectionError = '';
+        toast('Selection ready', `${num((advice.clean_ids || []).length)} safe/low-risk item(s) staged for review. Nothing has been removed.`, 'ok');
+      } else {
+        state.chatSelectionIds = [];
+        state.chatSelectionError = advice.error || 'No local model processed the cleanup instructions.';
+        toast('Preferences not applied', 'The offline fallback did not use your custom instructions; nothing was selected.', 'warn');
+      }
+      if (result) {
+        result.innerHTML = chatSelectionResultHtml(advice);
+        result.querySelectorAll('[data-chat-nav]').forEach((nav) => {
+          nav.addEventListener('click', () => navigate(nav.dataset.chatNav));
+        });
+      }
+    } catch (error) {
+      state.chatSelectionError = error.message;
+      if (result) result.innerHTML = errorCard(error);
+      toast('AI selection failed', error.message, 'err');
+    } finally {
+      state.chatSelectionBusy = false;
+      updateChatControls();
+    }
   }
 
   async function sendChat() {
     const input = $('#chat-text');
     const text = (input.value || '').trim();
     if (!text || state.chatBusy) return;
+    if (state.providerChoice === 'heuristic') {
+      toast('Choose a chat model', 'The offline rule engine scores findings but cannot understand free-form chat.', 'warn');
+      return;
+    }
+    invalidateChatSelection();
+    state.cleanupInstructions = '';
     input.value = '';
     state.chat.push({ role: 'user', text });
     const bot = { role: 'assistant', text: '', streaming: true, who: state.providerChoice || 'auto' };
     state.chat.push(bot);
     state.chatBusy = true;
     paintChat();
+    updateChatControls();
     try {
       await API.sse('/api/chat', {
         message: text,
-        history: state.chat.slice(0, -2).slice(-12).map((m) => ({ role: m.role, content: m.text })),
+        history: state.chat.slice(0, -2).slice(-12).map((message) => ({ role: message.role, content: message.text })),
         job_id: state.jobId,
         provider: state.providerChoice || 'auto',
+        model: state.modelChoice || null,
         stream: true,
       }, {
         meta: (data) => { bot.who = `${data.engine || ''}${data.model ? ' · ' + data.model : ''}`; },
@@ -1671,6 +2031,7 @@
       state.chatBusy = false;
       bot.streaming = false;
       paintChat();
+      updateChatControls();
     }
   }
 
@@ -2039,12 +2400,19 @@ DISKFREE_PROVIDER=auto</span>
       setNavOpen(!document.body.classList.contains('nav-open'));
     });
     $('#nav-backdrop').addEventListener('click', () => setNavOpen(false));
+    $('#model-select').addEventListener('change', (event) => {
+      const choice = parseModelChoice(event.currentTarget.value);
+      setModelChoice(choice.provider, choice.model);
+    });
     $('#nav').addEventListener('click', (event) => {
       const item = event.target.closest('.nav-item');
       if (item) navigate(item.dataset.view);
     });
     $('#btn-quick-scan').addEventListener('click', () => startScan({ preset: 'quick' }));
+    $('#btn-open-chat').addEventListener('click', () => navigate('assistant'));
     $('#btn-advise').addEventListener('click', () => navigate('advisor'));
+    renderModelSelector();
+    loadProviders().catch(() => {});
     $('#modal').addEventListener('close', closeModal);
     document.addEventListener('keydown', (event) => {
       if (event.key === 'Escape') {

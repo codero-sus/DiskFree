@@ -219,7 +219,7 @@ def test_cleaning_a_high_risk_item_is_downgraded_to_review(scan_result: ScanResu
     assert any(event.kind == "high_risk_needs_review" for event in events)
 
 
-def test_non_actionable_findings_can_only_be_kept_or_reviewed(scan_result: ScanResult) -> None:
+def test_non_actionable_findings_can_only_be_reviewed_or_manual(scan_result: ScanResult) -> None:
     findings = findings_of(scan_result)
     informational = next(
         finding for finding in scan_result.findings if not finding.actionable
@@ -228,7 +228,7 @@ def test_non_actionable_findings_can_only_be_kept_or_reviewed(scan_result: ScanR
         payload_of(rec(informational.id, action="clean", risk="safe")), findings
     )
     item = cleaned["items"][0]
-    assert item.action in {Action.KEEP, Action.REVIEW}
+    assert item.action in {Action.KEEP, Action.REVIEW, Action.MANUAL}
     assert item.action is not Action.CLEAN
 
 

@@ -112,6 +112,9 @@ def test_the_webui_is_served(client: TestClient) -> None:
     assert response.headers["content-type"].startswith("text/html")
     assert "DiskFree" in response.text
     assert 'name="author" content="codero-sus"' in response.text
+    assert 'id="model-select"' in response.text
+    assert 'id="btn-open-chat"' in response.text
+    assert "Cleanup Chat" in response.text
     assert "Made with" in response.text
     assert "https://github.com/codero-sus" in response.text
     assert "https://the-codero.web.app/" in response.text
@@ -458,6 +461,37 @@ def test_advice_works_offline(client: TestClient, fake_home: FakeHome) -> None:
             assert item["risk"] in {"safe", "low"}
             assert item["finding_id"] in advice["clean_ids"]
     assert advice["totals"]["clean"]["items"] >= 1
+
+
+def test_custom_cleanup_instructions_require_a_local_model(
+    client: TestClient, fake_home: FakeHome
+) -> None:
+    job = completed_scan(client, fake_home)
+    response = client.post(
+        "/api/advise",
+        json={
+            "job_id": job["id"],
+            "provider": "heuristic",
+            "instructions": "Clear caches but keep my documents.",
+        },
+    )
+    assert response.status_code == 409
+    assert "local language model" in response.json()["detail"]["error"]
+
+
+def test_offline_advice_does_not_claim_to_use_custom_instructions(
+    client: TestClient, fake_home: FakeHome
+) -> None:
+    job = completed_scan(client, fake_home)
+    response = client.post(
+        "/api/advise",
+        json={"job_id": job["id"], "instructions": "Clear caches, keep Downloads."},
+    )
+    assert response.status_code == 200, response.text
+    advice = response.json()
+    assert advice["custom_instructions_requested"] is True
+    assert advice["custom_instructions_processed"] is False
+    assert advice["fallback_used"] is True
 
 
 def test_advice_is_stored_on_the_scan(client: TestClient, fake_home: FakeHome) -> None:

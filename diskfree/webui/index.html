@@ -41,7 +41,7 @@
       <button class="nav-item" data-view="advisor"><span class="ico">✦</span>AI Advisor</button>
       <button class="nav-item" data-view="clean"><span class="ico">🧹</span>Clean</button>
       <button class="nav-item" data-view="history"><span class="ico">↩</span>History</button>
-      <button class="nav-item" data-view="assistant"><span class="ico">💬</span>Assistant</button>
+      <button class="nav-item" data-view="assistant"><span class="ico">💬</span>Cleanup Chat</button>
       <div class="nav-sep"></div>
       <button class="nav-item" data-view="rules"><span class="ico">📐</span>Rules</button>
       <button class="nav-item" data-view="safety"><span class="ico">🛡</span>Safety</button>
@@ -85,6 +85,20 @@
         <span class="pill" id="pill-readonly" hidden title="DiskFree cannot modify anything">read-only</span>
         <span class="pill" id="pill-scan" hidden>scan idle</span>
         <button class="btn btn-ghost" id="btn-quick-scan" title="Scan your home directory">Quick scan</button>
+        <label class="model-picker" title="Choose the local model used for chat and AI advice">
+          <span class="sr-only">Local AI model</span>
+          <select id="model-select" aria-label="Select local AI model">
+            <option value="auto|">Auto · best available</option>
+            <option value="heuristic|">Rule engine · offline</option>
+          </select>
+          <span class="model-caret" aria-hidden="true">⌄</span>
+        </label>
+        <button class="btn btn-ghost" id="btn-open-chat" aria-label="Open cleanup chat"
+                title="Tell the AI what to clear and what to keep">
+          <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+            <path d="M20 11.5a7.5 7.5 0 0 1-7.5 7.5H7l-3 2v-5.1A7.5 7.5 0 1 1 20 11.5Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg><span>Chat</span>
+        </button>
         <button class="btn btn-primary" id="btn-advise" title="Analyse the latest scan">✦ Analyse</button>
       </div>
     </header>
