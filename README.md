@@ -250,7 +250,7 @@ running `diskfree serve`.
 
 ```bash
 pip install -e ".[test]"
-pytest -q                 # 533 passed, 1 skipped
+pytest -q                 # full suite
 ruff check .              # the lint policy lives in pyproject.toml
 ```
 
@@ -258,6 +258,8 @@ The suite covers the safety policy, the rule table, the scanner, the trash backe
 and journal, the guardrails, both AI providers (over a mocked transport), the plan /
 execute / undo machinery, the HTTP API end to end, configuration, the CLI, and the
 updater — which is tested against a real local git remote, including the refusals.
+The staged 200-item improvement program and implementation status are tracked in
+[`docs/IMPROVEMENT_ROADMAP.md`](docs/IMPROVEMENT_ROADMAP.md).
 
 ```
 diskfree/

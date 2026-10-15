@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from ..safety.policy import Risk
 from ..scanner.disks import disk_summary
 from ..scanner.engine import ScanOptions
-from ..scanner.jobs import JobManager, ScanStatus, default_options, risk_summary
+from ..scanner.jobs import JobManager, ScanCapacityError, ScanStatus, default_options, risk_summary
 from ..scanner.rules import CATEGORY_META, Category
 from ..util import human_bytes
 from .deps import AppState, get_state
@@ -133,7 +133,17 @@ async def start_scan(
                 "hint": "Pick existing directories; ~ and environment variables are expanded.",
             },
         )
-    job = state.jobs.start(options)
+    try:
+        job = state.jobs.start(options)
+    except ScanCapacityError as exc:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": "The scan concurrency limit has been reached.",
+                "hint": str(exc),
+            },
+            headers={"Retry-After": "5"},
+        ) from exc
     return {
         "job": job.summary(),
         "message": "Scan started. Poll /api/scans/{job_id} for progress.",
@@ -149,6 +159,8 @@ async def list_scans(
         "jobs": [job.summary() for job in jobs.list(limit=limit)],
         "latest": (jobs.latest() or _empty_job()).id if jobs.latest() else None,
         "retention": jobs.retention,
+        "active": jobs.active_count(),
+        "max_running": jobs.max_running,
     }
 
 

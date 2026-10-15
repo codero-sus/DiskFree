@@ -276,6 +276,35 @@ def test_missing_dependencies_detects_an_absent_package(tmp_path: Path) -> None:
     assert "definitely_not_a_real_module" not in found
 
 
+def test_dependency_probe_failure_is_not_reported_as_all_packages_present() -> None:
+    assert updater.missing_dependencies(REPO_ROOT, "/no/such/diskfree-python") is None
+
+
+def test_update_check_mode_never_invokes_pip(monkeypatch: pytest.MonkeyPatch) -> None:
+    options = updater.UpdateOptions(
+        root=REPO_ROOT, python=sys.executable, check_only=True, upgrade_dependencies=True
+    )
+    report = updater.UpdateReport(root=str(REPO_ROOT), python=sys.executable)
+
+    def unexpected_pip(*_args, **_kwargs):
+        pytest.fail("--check must never invoke pip")
+
+    monkeypatch.setattr(updater, "_pip", unexpected_pip)
+    assert updater.update_dependencies(options, report) is True
+    assert "importable" in next(step.detail for step in report.steps)
+
+
+def test_subprocess_timeout_keeps_partial_output() -> None:
+    result = updater.run(
+        [sys.executable, "-c", "import time; print('started', flush=True); time.sleep(2)"],
+        timeout=0.05,
+    )
+
+    assert result.timed_out is True
+    assert result.returncode == 124
+    assert "started" in result.output
+
+
 # --------------------------------------------------------------------------
 # the real update flow
 # --------------------------------------------------------------------------

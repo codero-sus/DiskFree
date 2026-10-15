@@ -31,6 +31,10 @@ class ScanStatus(str, Enum):
     FAILED = "failed"
 
 
+class ScanCapacityError(RuntimeError):
+    """Raised when starting another scan would exceed the concurrency cap."""
+
+
 @dataclass
 class ScanJob:
     """One scan, from request to result."""
@@ -117,20 +121,39 @@ class JobManager:
         *,
         policy: SafetyPolicy | None = None,
         retention: int = 8,
+        max_running: int = 2,
     ) -> None:
         self.settings = settings or Settings()
         self.policy = policy or SafetyPolicy(self.settings.safety)
         self.retention = max(1, retention)
+        self.max_running = max(1, max_running)
         self._jobs: OrderedDict[str, ScanJob] = OrderedDict()
         self._lock = threading.RLock()
 
     # -- lifecycle -------------------------------------------------------
+    def active_count(self) -> int:
+        """Number of queued or running jobs, used for admission and status views."""
+
+        with self._lock:
+            return sum(
+                job.status in {ScanStatus.QUEUED, ScanStatus.RUNNING}
+                for job in self._jobs.values()
+            )
+
     def start(self, options: ScanOptions) -> ScanJob:
         """Create a job and run it on a daemon thread."""
 
         job = ScanJob(id=new_id("scan"), options=options)
         job.result = ScanResult(job_id=job.id, roots=list(options.roots))
         with self._lock:
+            active = sum(
+                item.status in {ScanStatus.QUEUED, ScanStatus.RUNNING}
+                for item in self._jobs.values()
+            )
+            if active >= self.max_running:
+                raise ScanCapacityError(
+                    f"At most {self.max_running} scans may run at once; {active} are active."
+                )
             self._jobs[job.id] = job
             self._evict_locked()
 
@@ -138,7 +161,12 @@ class JobManager:
             target=self._run, args=(job,), name=f"diskfree-scan-{job.id}", daemon=True
         )
         job.thread = thread
-        thread.start()
+        try:
+            thread.start()
+        except RuntimeError:
+            with self._lock:
+                self._jobs.pop(job.id, None)
+            raise
         return job
 
     def _run(self, job: ScanJob) -> None:
