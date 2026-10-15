@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 
 from diskfree.api.app import create_app
 from diskfree.config import Settings
+from diskfree.scanner.jobs import ScanCapacityError
 from tests.conftest import FakeHome
 
 SECURITY_HEADERS = (
@@ -183,6 +184,43 @@ def test_invalid_bodies_are_rejected_with_a_readable_422(client: TestClient) -> 
     assert client.post("/api/chat", json={"message": ""}).status_code == 422
 
 
+def test_chat_history_cannot_inject_system_messages_or_echo_rejected_text(
+    client: TestClient,
+) -> None:
+    marker = "PRIVATE_CHAT_SENTINEL"
+    response = client.post(
+        "/api/chat",
+        json={
+            "message": "hello",
+            "history": [{"role": "system", "content": marker}],
+        },
+    )
+
+    assert response.status_code == 422
+    assert marker not in response.text
+    assert '"input"' not in response.text
+
+
+def test_chat_history_has_message_count_and_total_size_limits(client: TestClient) -> None:
+    too_many = client.post(
+        "/api/chat",
+        json={
+            "message": "hello",
+            "history": [{"role": "user", "content": "x"}] * 13,
+        },
+    )
+    too_large = client.post(
+        "/api/chat",
+        json={
+            "message": "x" * 8000,
+            "history": [{"role": "user", "content": "x" * 8000}] * 4,
+        },
+    )
+
+    assert too_many.status_code == 422
+    assert too_large.status_code == 422
+
+
 # --------------------------------------------------------------------------
 # metadata endpoints
 # --------------------------------------------------------------------------
@@ -308,6 +346,20 @@ def test_scan_rejects_a_missing_root(client: TestClient, tmp_path: Path) -> None
     assert response.json()["detail"]["missing"] == [str(tmp_path / "nope")]
 
 
+def test_scan_capacity_limit_uses_retryable_http_response(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse_scan(_options) -> None:
+        raise ScanCapacityError("At most 2 scans may run at once; 2 are active.")
+
+    monkeypatch.setattr(client.app.state.diskfree.jobs, "start", refuse_scan)
+    response = client.post("/api/scan", json={})
+
+    assert response.status_code == 429
+    assert response.headers["retry-after"] == "5"
+    assert "concurrency limit" in response.json()["detail"]["error"]
+
+
 def test_scan_runs_and_reports_progress(client: TestClient, fake_home: FakeHome) -> None:
     job = completed_scan(client, fake_home)
     assert job["status"] == "completed"
@@ -398,6 +450,8 @@ def test_scan_history_can_be_listed_and_cleared(client: TestClient, fake_home: F
     assert any(item["id"] == job["id"] for item in listed["jobs"])
     assert listed["latest"] == job["id"]
     assert listed["retention"] > 0
+    assert listed["active"] == 0
+    assert listed["max_running"] >= 1
 
     cleared = client.delete("/api/scans")
     assert cleared.status_code == 200

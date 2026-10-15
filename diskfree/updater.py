@@ -460,7 +460,6 @@ def run(
     env.update(GIT_ENV)
     if extra_env:
         env.update(extra_env)
-    started = time.monotonic()
     try:
         completed = subprocess.run(
             command,
@@ -473,16 +472,22 @@ def run(
         )
     except FileNotFoundError as exc:
         return CommandResult(command, 127, f"{command[0]}: not found ({exc})")
-    except subprocess.TimeoutExpired:
-        return CommandResult(
-            command, 124, f"timed out after {timeout}s", timed_out=True
-        )
+    except subprocess.TimeoutExpired as exc:
+        partial = []
+        for output in (exc.stdout, exc.stderr):
+            if isinstance(output, bytes):
+                output = output.decode("utf-8", errors="replace")
+            if output and output.strip():
+                partial.append(output.strip())
+        detail = f"timed out after {timeout}s"
+        if partial:
+            detail += "\n" + "\n".join(partial)
+        return CommandResult(command, 124, detail, timed_out=True)
     except OSError as exc:
         return CommandResult(command, 1, f"could not run {command[0]}: {exc}")
     output = "\n".join(
         part for part in (completed.stdout or "", completed.stderr or "") if part.strip()
     ).strip()
-    _ = started
     return CommandResult(command, completed.returncode, output)
 
 
@@ -837,8 +842,8 @@ def commit_log(root: Path, old: str, new: str) -> list[str]:
     return [line for line in result.output.splitlines() if line.strip()]
 
 
-def missing_dependencies(root: Path, python: str) -> list[str]:
-    """Third-party imports DiskFree needs that this interpreter cannot load."""
+def missing_dependencies(root: Path, python: str) -> list[str] | None:
+    """Return missing imports, or ``None`` when this interpreter could not be probed."""
 
     probe = (
         "import importlib.util as u;"
@@ -847,7 +852,7 @@ def missing_dependencies(root: Path, python: str) -> list[str]:
     )
     result = run([python, "-c", probe], cwd=root, timeout=120)
     if not result.ok:
-        return []
+        return None
     return [name for name in result.output.split() if name]
 
 
@@ -1143,8 +1148,35 @@ def update_dependencies(options: UpdateOptions, report: UpdateReport) -> bool:
         report.add(Step("dependencies", skipped=True, detail="--no-deps"))
         return True
 
+    # Check mode is strictly read-only: probe imports before any pip invocation.
+    if options.check_only:
+        missing = missing_dependencies(options.root, options.python)
+        if missing is None:
+            report.add(
+                Step(
+                    "dependencies",
+                    ok=False,
+                    skipped=True,
+                    detail="could not inspect dependencies with the selected Python",
+                    hint="Check the interpreter path and make sure it can run a Python probe.",
+                )
+            )
+            return False
+        report.add(
+            Step(
+                "dependencies",
+                skipped=True,
+                ok=True,
+                detail="all required packages are importable"
+                if not missing
+                else f"missing: {', '.join(missing)}",
+                hint="" if not missing else "Re-run without --check to install them.",
+            )
+        )
+        return not missing
+
     if report.venv:
-        pip_upgrade = _pip(options, "install", "--upgrade", "pip", timeout=options.timeout)
+        pip_upgrade = _pip(options, "install", "--upgrade", "pip")
         report.add(
             Step(
                 "pip",
@@ -1163,21 +1195,6 @@ def update_dependencies(options: UpdateOptions, report: UpdateReport) -> bool:
         args += ["-e", "."]
     else:
         args.append(".")
-    if options.check_only:
-        missing = missing_dependencies(options.root, options.python)
-        report.add(
-            Step(
-                "dependencies",
-                skipped=True,
-                ok=True,
-                detail="all required packages are importable"
-                if not missing
-                else f"missing: {', '.join(missing)}",
-                hint="" if not missing else "Re-run without --check to install them.",
-            )
-        )
-        return not missing
-
     installed = _pip(options, *args)
     if installed.ok:
         report.add(

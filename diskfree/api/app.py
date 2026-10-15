@@ -6,6 +6,7 @@ origin as the API, so the browser never talks to anything but this process.
 
 from __future__ import annotations
 
+import hmac
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -51,7 +52,10 @@ class TokenAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         if self.token and not _exempt(request.url.path):
             supplied = _bearer_of(request)
-            if supplied != self.token:
+            valid = supplied is not None and hmac.compare_digest(
+                supplied.encode("utf-8"), self.token.encode("utf-8")
+            )
+            if not valid:
                 return JSONResponse(
                     status_code=401,
                     content={
@@ -165,9 +169,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.exception_handler(RequestValidationError)
     async def validation_handler(_: Request, exc: RequestValidationError) -> JSONResponse:
+        # Pydantic errors include the rejected value by default. Do not echo local
+        # paths, chat text, tokens, or other request data back in API responses.
+        details = [
+            {
+                "loc": [str(part) for part in error.get("loc", ())],
+                "msg": str(error.get("msg", "Invalid value")),
+                "type": str(error.get("type", "value_error")),
+            }
+            for error in exc.errors()
+        ]
         return JSONResponse(
             status_code=422,
-            content={"error": "The request body was not valid.", "detail": exc.errors()},
+            content={"error": "The request body was not valid.", "detail": details},
         )
 
     @app.get("/", include_in_schema=False)

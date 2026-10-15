@@ -11,6 +11,7 @@ import pytest
 
 from diskfree.safety.policy import Risk, Tier
 from diskfree.scanner.engine import Scanner, ScanOptions, ScanProgress
+from diskfree.scanner.jobs import JobManager, ScanCapacityError, ScanStatus
 from diskfree.scanner.models import ScanResult
 from tests.conftest import MB, FakeHome, _write
 
@@ -234,6 +235,31 @@ def test_scan_can_be_cancelled(scanner: Scanner, fake_home: FakeHome) -> None:
     result = cancellable.run(ScanOptions(roots=[fake_home.root], temp_min_age_days=10**6))
     assert result.findings == []
     assert result.stats.dirs_seen == 0
+
+
+def test_job_manager_caps_concurrent_scans(
+    settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_scan(_scanner: Scanner, options: ScanOptions) -> ScanResult:
+        entered.set()
+        release.wait(timeout=3)
+        return ScanResult(job_id="test", roots=list(options.roots))
+
+    monkeypatch.setattr(Scanner, "run", blocking_scan)
+    manager = JobManager(settings, max_running=1)
+    first = manager.start(ScanOptions(roots=[tmp_path]))
+    try:
+        assert entered.wait(timeout=3)
+        with pytest.raises(ScanCapacityError, match="At most 1 scans"):
+            manager.start(ScanOptions(roots=[tmp_path]))
+    finally:
+        release.set()
+        if first.thread is not None:
+            first.thread.join(timeout=3)
+    assert first.status is ScanStatus.COMPLETED
 
 
 def test_progress_callback_reports_phases(
